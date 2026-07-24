@@ -31,21 +31,25 @@ The installed ego lite runtime (0.4.4.x) preloads the **helper API** — `useOrC
 3. **Handle the exit code:**
    - `0` with `{"status":"ok", ...}` — continue to step 4.
    - `42` (`login_required`) — hand the browser to the user so they can log in:
-     ```
-     const t = await useOrCreateTaskSpace('chatgpt image generation')
-     const h = await handOffTaskSpace(t.id)   // check h.done
-     ```
-     Tell the user to log into ChatGPT in the ego lite window and say when done. Only after they confirm, run `await takeOverTaskSpace(t.id)` in a new heredoc, then rerun the script.
+      ```bash
+      ego-browser nodejs <<'EOF'
+      const t = await useOrCreateTaskSpace('chatgpt image generation')
+      const h = await handOffTaskSpace(t.id)
+      cliLog(JSON.stringify(h))
+      EOF
+      ```
+      Check `h.done`, then tell the user to log into ChatGPT in the ego lite window and say when done. Only after they confirm, take control back with a new `ego-browser nodejs` heredoc using `takeOverTaskSpace('chatgpt image generation')`, then rerun the generator.
    - `1` with `image_timeout` — generation may still be running; open the conversation URL from the output, check visually with `captureScreenshot()`, and if the image has since appeared, fetch it manually (the poll + download snippet in the script is the reference). Otherwise report the failure.
 
 4. **Verify the saved image** — check it exists, has non-trivial size, and visually inspect it (e.g. read the image file) to confirm the content matches the description.
 
-5. **Close the task space** in a dedicated final heredoc, only after verification passed:
+5. **Close the task space** only after verification passed. Use the bundled idempotent cleanup script instead of composing a CLI command or calling `completeTaskSpace` directly:
 
+   ```bash
+   bash <this-skill-dir>/scripts/close-task-space.sh
    ```
-   const c = await completeTaskSpace('chatgpt image generation', { keep: false })
-   // check c.done === true
-   ```
+
+   `{"status":"closed", ...}` means it closed the task space. `{"status":"already_closed", ...}` is also success: a previous cleanup already removed it. Do not run `ego-browser --help` as a cleanup workaround.
 
 6. **Report** the saved file path and the ChatGPT conversation URL (from the script output) to the user.
 
