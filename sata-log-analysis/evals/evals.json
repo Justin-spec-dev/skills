@@ -3,7 +3,7 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "帮我分析一下这份服务器日志，硬盘好像有问题：/home/code1/Documents/skills/sata-log-analysis/examples/sample-ata-timeout-eh.log。没有内核源码。",
+      "prompt": "帮我分析一下这份服务器日志，硬盘好像有问题：examples/sample-ata-timeout-eh.log。没有内核源码。",
       "expected_output": "生成符合 report-template.md 结构的 SATA 故障分析报告：识别出 ata2/sdb 的 3 次 NCQ 写超时周期，说明 EH 触发与恢复过程，按 P1/P2/P3 给出根因推测（不直接断言硬盘损坏、不引用无出处固件口碑），给出分层排查建议，明确标注未提供源码、绝对时间戳缺失等信息缺口。",
       "files": [
         "examples/sample-ata-timeout-eh.log"
@@ -40,7 +40,7 @@
     },
     {
       "id": 2,
-      "prompt": "我们的存储柜挂了 SATA 扩展口，这是 dmesg：/home/code1/Documents/skills/sata-log-analysis/examples/sample-sata-pmp-failure.log 看看是什么问题。源码目录没有。",
+      "prompt": "我们的存储柜挂了 SATA 扩展口，这是 dmesg：examples/sample-sata-pmp-failure.log 看看是什么问题。源码目录没有。",
       "expected_output": "识别 ata2.15 为 SATA Port Multiplier（4 端口），区分 ata2 主链路与 ata2.00/01/02 子端口；指出故障集中在 ata2.01（sdc）且其余子端口正常；正确解码 SErr 位并指向信号完整性；注意第 4 个周期 softreset failed 的升级迹象；给出 PMP 场景特有的排查建议。",
       "files": [
         "examples/sample-sata-pmp-failure.log"
@@ -106,7 +106,7 @@
     },
     {
       "id": 4,
-      "prompt": "这份日志帮我分析下：/home/code1/Documents/skills/sata-log-analysis/examples/sample-ata-timeout-eh.log。内核源码在 /home/code1/Documents/skills/sata-log-analysis-workspace/mock-kernel-source/",
+      "prompt": "这份日志帮我分析下：examples/sample-ata-timeout-eh.log。内核源码在 evals/fixtures/mock-kernel-source/",
       "expected_output": "验证源码目录有效性并读取 Makefile 版本 5.15.87；显著标注与日志内核 5.15.0-91 不一致；生成含内核源码分析章的报告，每条源码结论含文件/函数/对应日志且与所提供源码文本一致；不编造源码中不存在的函数或文件。",
       "files": [
         "examples/sample-ata-timeout-eh.log"
@@ -135,5 +135,6 @@
         }
       ]
     }
-  ]
+  ],
+  "notes": "prompt 中的路径相对于技能根目录（sata-log-analysis/）。eval-4 使用 evals/fixtures/mock-kernel-source/ 作为模拟内核源码树（版本 5.15.87，故意与样例日志的 5.15.0-91 不一致，用于测试版本比对与防编造约束）。"
 }

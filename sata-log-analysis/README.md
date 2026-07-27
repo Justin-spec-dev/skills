@@ -17,7 +17,8 @@ sata-log-analysis/
 │   ├── sample-sata-pmp-failure.log   # 测试样例 2：SATA PM/PMP 下挂磁盘故障
 │   └── sample-report.md              # 由样例 1 生成的示例分析报告
 ├── evals/
-│   └── evals.json                    # 评估用测试提示
+│   ├── evals.json                    # 评估用测试提示与断言（路径相对于本目录）
+│   └── fixtures/mock-kernel-source/  # eval-4 用模拟内核源码树（5.15.87，故意与样例日志版本不一致）
 └── dist/
     └── sata-log-analysis.generic.md  # 平台无关单文件版（内联核心参考内容）
 ```

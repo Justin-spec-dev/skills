@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0
+# 模拟内核源码树 Kbuild（评估用）
+obj-y += drivers/
