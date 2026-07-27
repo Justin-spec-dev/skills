@@ -1,0 +1,76 @@
+[    0.000000] Linux version 6.1.0-18-amd64 (debian-kernel@lists.debian.org) (gcc (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.76-1 (2024-02-01)
+[    2.011245] ahci 0000:01:00.0: version 3.0
+[    2.011388] ahci 0000:01:00.0: AHCI 0001.0300 32 slots 2 ports 6 Gbps 0x3 impl SATA mode
+[    2.011401] ahci 0000:01:00.0: flags: 64bit ncq sntf stag pm led clo only pmp pio slum part ccc apst
+[    2.030144] scsi host0: ahci
+[    2.030351] scsi host1: ahci
+[    2.030477] ata1: SATA max UDMA/133 abar m8192@0xf7c10000 port 0xf7c10100 irq 30
+[    2.030480] ata2: SATA max UDMA/133 abar m8192@0xf7c10000 port 0xf7c10180 irq 30
+[    2.344001] ata1: SATA link up 6.0 Gbps (SStatus 133 SControl 300)
+[    2.344118] ata2: SATA link up 6.0 Gbps (SStatus 133 SControl 300)
+[    2.346512] ata1.00: ATA-11: Samsung SSD 860 EVO 500GB, RVT04B6Q, max UDMA/133
+[    2.346515] ata1.00: 976773168 sectors, multi 1: LBA48 NCQ (depth 32), AA
+[    2.348801] ata1.00: configured for UDMA/133
+[    2.349502] scsi 0:0:0:0: Direct-Access     ATA      Samsung SSD 860  4B6Q PQ: 0 ANSI: 5
+[    2.349908] sd 0:0:0:0: [sda] 976773168 512-byte logical blocks: (500 GB/466 GiB)
+[    2.650022] ata2.15: Port Multiplier 1.2, 0x109d:0x1234 r1, 4 ports, feat 0x6/0xf
+[    2.660112] ata2.00: hard resetting link
+[    2.980455] ata2.00: SATA link up 3.0 Gbps (SStatus 123 SControl 320)
+[    2.981102] ata2.00: ATA-9: ST8000DM004-2CX188, 0001, max UDMA/133
+[    2.981105] ata2.00: 15628053168 sectors, multi 16: LBA48 NCQ (depth 32), AA
+[    2.983001] ata2.00: configured for UDMA/133
+[    2.983801] scsi 1:0:0:0: Direct-Access     ATA      ST8000DM004-2CX1 0001 PQ: 0 ANSI: 5
+[    2.984201] sd 1:0:0:0: [sdb] 15628053168 512-byte logical blocks: (8.00 TB/7.28 TiB)
+[    2.990122] ata2.01: hard resetting link
+[    3.310511] ata2.01: SATA link up 3.0 Gbps (SStatus 123 SControl 320)
+[    3.311150] ata2.01: ATA-9: ST8000DM004-2CX188, 0001, max UDMA/133
+[    3.311153] ata2.01: 15628053168 sectors, multi 16: LBA48 NCQ (depth 32), AA
+[    3.313050] ata2.01: configured for UDMA/133
+[    3.313850] scsi 1:0:1:0: Direct-Access     ATA      ST8000DM004-2CX1 0001 PQ: 0 ANSI: 5
+[    3.314250] sd 1:0:1:0: [sdc] 15628053168 512-byte logical blocks: (8.00 TB/7.28 TiB)
+[    3.320333] ata2.02: hard resetting link
+[    3.640622] ata2.02: SATA link up 3.0 Gbps (SStatus 123 SControl 320)
+[    3.641260] ata2.02: ATA-9: ST8000DM004-2CX188, 0001, max UDMA/133
+[    3.641263] ata2.02: 15628053168 sectors, multi 16: LBA48 NCQ (depth 32), AA
+[    3.643161] ata2.02: configured for UDMA/133
+[    3.643960] scsi 1:0:2:0: Direct-Access     ATA      ST8000DM004-2CX1 0001 PQ: 0 ANSI: 5
+[    3.644360] sd 1:0:2:0: [sdd] 15628053168 512-byte logical blocks: (8.00 TB/7.28 TiB)
+[ 5211.447812] ata2.01: exception Emask 0x10 SAct 0x8000000 SErr 0x1990000 action 0xe frozen
+[ 5211.447830] ata2.01: failed command: WRITE FPDMA QUEUED
+[ 5211.447841] ata2.01: cmd 61/40:d8:00:90:04/01:00:02:00:00/40 tag 27 ncq dma 147456 out
+                         res 40/00:d8:00:90:04/00:00:02:00:00/40 Emask 0x10 (ATA bus error)
+[ 5211.447852] ata2.01: status: { DRDY }
+[ 5211.447860] ata2.01: hard resetting link
+[ 5211.760112] ata2.01: SATA link up 3.0 Gbps (SStatus 123 SControl 320)
+[ 5211.761502] ata2.01: configured for UDMA/133
+[ 5211.761514] ata2.01: EH complete
+[ 5217.102355] ata2.01: exception Emask 0x10 SAct 0x400000 SErr 0x1d90000 action 0xe frozen
+[ 5217.102371] ata2.01: failed command: WRITE FPDMA QUEUED
+[ 5217.102381] ata2.01: cmd 61/20:b0:40:90:04/00:00:02:00:00/40 tag 22 ncq dma 16384 out
+                         res 40/00:b0:40:90:04/00:00:02:00:00/40 Emask 0x10 (ATA bus error)
+[ 5217.102391] ata2.01: status: { DRDY }
+[ 5217.102399] ata2.01: hard resetting link
+[ 5217.414655] ata2.01: SATA link up 3.0 Gbps (SStatus 123 SControl 320)
+[ 5217.416043] ata2.01: configured for UDMA/133
+[ 5217.416055] ata2.01: EH complete
+[ 5233.881702] ata2.01: exception Emask 0x10 SAct 0x2000 SErr 0x1b90000 action 0xe frozen
+[ 5233.881718] ata2.01: failed command: READ FPDMA QUEUED
+[ 5233.881728] ata2.01: cmd 60/08:68:00:41:07/00:00:1c:00:00/40 tag 13 ncq dma 4096 in
+                         res 40/00:68:00:41:07/00:00:1c:00:00/40 Emask 0x10 (ATA bus error)
+[ 5233.881738] ata2.01: status: { DRDY }
+[ 5233.881746] ata2.01: hard resetting link
+[ 5234.194001] ata2.01: SATA link up 3.0 Gbps (SStatus 123 SControl 320)
+[ 5234.195389] ata2.01: configured for UDMA/133
+[ 5234.195401] ata2.01: EH complete
+[ 5290.115533] ata2.01: exception Emask 0x10 SAct 0x800000 SErr 0x1f90000 action 0xe frozen
+[ 5290.115549] ata2.01: failed command: WRITE FPDMA QUEUED
+[ 5290.115559] ata2.01: cmd 61/08:b8:80:90:04/00:00:02:00:00/40 tag 23 ncq dma 4096 out
+                         res 40/00:b8:80:90:04/00:00:02:00:00/40 Emask 0x10 (ATA bus error)
+[ 5290.115569] ata2.01: status: { DRDY }
+[ 5290.115577] ata2.01: hard resetting link
+[ 5294.427801] ata2.01: link is slow to respond, please be patient (ready=0)
+[ 5299.062211] ata2.01: softreset failed (device not ready)
+[ 5299.062219] ata2.01: hard resetting link
+[ 5299.374455] ata2.01: SATA link up 3.0 Gbps (SStatus 123 SControl 320)
+[ 5299.375843] ata2.01: configured for UDMA/133
+[ 5299.375855] ata2.01: EH complete

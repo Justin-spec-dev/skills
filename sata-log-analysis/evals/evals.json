@@ -1,0 +1,139 @@
+{
+  "skill_name": "sata-log-analysis",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我分析一下这份服务器日志，硬盘好像有问题：/home/code1/Documents/skills/sata-log-analysis/examples/sample-ata-timeout-eh.log。没有内核源码。",
+      "expected_output": "生成符合 report-template.md 结构的 SATA 故障分析报告：识别出 ata2/sdb 的 3 次 NCQ 写超时周期，说明 EH 触发与恢复过程，按 P1/P2/P3 给出根因推测（不直接断言硬盘损坏、不引用无出处固件口碑），给出分层排查建议，明确标注未提供源码、绝对时间戳缺失等信息缺口。",
+      "files": [
+        "examples/sample-ata-timeout-eh.log"
+      ],
+      "assertions": [
+        {
+          "text": "报告包含模板章节结构（分析结论/环境与设备信息/故障时间线/关键日志解析/libata EH 流程分析/根因推测/排查与验证方案/信息缺口/最终判断；无源码时内核源码章可省略但须有一句话注明）"
+        },
+        {
+          "text": "正确识别故障端口为 ata2，且映射到 sdb，并给出 ataX/hostX/sdX 映射"
+        },
+        {
+          "text": "识别出 3 个故障周期（8642s、12901s、17355s 三次超时）"
+        },
+        {
+          "text": "说明 EH 被触发且每次设备都恢复（EH complete/configured for UDMA）"
+        },
+        {
+          "text": "未将'硬盘损坏/介质故障'作为最可能结论，且根因表格含支持证据与置信度"
+        },
+        {
+          "text": "报告明确注明本次未提供内核源码"
+        },
+        {
+          "text": "排查建议分层，且包含 smartctl 检查"
+        },
+        {
+          "text": "反幻觉：报告不得把型号/固件的'口碑''已知故障率''已知问题版本'作为根因的支持证据（以'建议查询厂商公告'形式出现在排查建议中则可以）"
+        },
+        {
+          "text": "计算并解读了故障间隔（约 4259s/4454s，近似周期性），未将其误判为'无规律'"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "我们的存储柜挂了 SATA 扩展口，这是 dmesg：/home/code1/Documents/skills/sata-log-analysis/examples/sample-sata-pmp-failure.log 看看是什么问题。源码目录没有。",
+      "expected_output": "识别 ata2.15 为 SATA Port Multiplier（4 端口），区分 ata2 主链路与 ata2.00/01/02 子端口；指出故障集中在 ata2.01（sdc）且其余子端口正常；正确解码 SErr 位并指向信号完整性；注意第 4 个周期 softreset failed 的升级迹象；给出 PMP 场景特有的排查建议。",
+      "files": [
+        "examples/sample-sata-pmp-failure.log"
+      ],
+      "assertions": [
+        {
+          "text": "报告包含模板章节结构（同 eval1 第 1 条的口径）"
+        },
+        {
+          "text": "识别 ata2.15 为 SATA Port Multiplier（PMP），并区分主链路 ata2 与子端口 ata2.00/01/02"
+        },
+        {
+          "text": "指出故障集中在 ata2.01（对应 sdc），且其余子端口在日志范围内正常"
+        },
+        {
+          "text": "SError 的 hex-位名映射正确：0x80000=10B8B、0x100000=Disparity、0x200000=CRC、0x400000=Handshake，无错位；且至少识别其中两项并与信号完整性关联"
+        },
+        {
+          "text": "注意到最后一个故障周期出现 'link is slow to respond' 和 'softreset failed'，并说明这是故障升级/恶化的迹象（如恢复耗时从 ~0.3s 恶化到 ~9.3s）"
+        },
+        {
+          "text": "给出 PMP 场景特有的排查建议（单盘直连绕过 PMP，或子端口/盘位对调）"
+        },
+        {
+          "text": "未断言 PMP 芯片或硬盘已损坏作为确定结论；未把消费级盘误称为企业级盘"
+        },
+        {
+          "text": "未把 ata2.00/ata2.01/ata2.02 之外的盘（如 sda SSD）推断为'系统盘'等日志未提供的角色"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "这段日志帮忙看下：[直接粘贴 ata2 三个故障周期片段，无其他文件]",
+      "expected_output": "按报告结构分析片段，信息缺口章明确列出缺少启动识别信息、绝对时间、SMART，结论置信度受限，不编造片段中不存在的硬件信息。",
+      "files": [],
+      "assertions": [
+        {
+          "text": "报告包含模板章节结构（同 eval1 第 1 条的口径）"
+        },
+        {
+          "text": "在信息缺口章明确指出缺少启动识别信息（硬盘型号/固件/控制器/ataX-sdX 映射无法确认）"
+        },
+        {
+          "text": "在信息缺口章指出时间戳为相对时间、缺少绝对时间"
+        },
+        {
+          "text": "结论置信度表述受限，未因片段日志直接断言硬盘损坏"
+        },
+        {
+          "text": "给出了需要用户补充的具体命令或文件（如 dmesg -T、journalctl -k、smartctl）"
+        },
+        {
+          "text": "反幻觉：不得声称片段中不存在的硬件信息（具体型号/控制器类型/序列号/盘角色）"
+        },
+        {
+          "text": "反过度排除：不得仅凭 SErr 0x0 就断言'排除链路/线缆问题'"
+        },
+        {
+          "text": "计算并解读了故障间隔（约 4259s/4454s，近似周期性），未将其误判为'无规律'"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "这份日志帮我分析下：/home/code1/Documents/skills/sata-log-analysis/examples/sample-ata-timeout-eh.log。内核源码在 /home/code1/Documents/skills/sata-log-analysis-workspace/mock-kernel-source/",
+      "expected_output": "验证源码目录有效性并读取 Makefile 版本 5.15.87；显著标注与日志内核 5.15.0-91 不一致；生成含内核源码分析章的报告，每条源码结论含文件/函数/对应日志且与所提供源码文本一致；不编造源码中不存在的函数或文件。",
+      "files": [
+        "examples/sample-ata-timeout-eh.log"
+      ],
+      "assertions": [
+        {
+          "text": "识别源码目录为有效内核源码树，并从根 Makefile 读取版本（5.15.87）"
+        },
+        {
+          "text": "显著标注源码版本（5.15.87）与日志内核版本（5.15.0-91-generic）不一致，并说明其影响（行号/行为可能漂移）"
+        },
+        {
+          "text": "报告保留并填充'内核源码分析'章节，每条结论包含源码文件、函数名和对应日志"
+        },
+        {
+          "text": "报告引用的函数真实存在于所提供的源码中（如 ata_eh_link_report、ata_qc_timeout、ahci_hardreset、sata_link_hardreset、sata_print_link_status 之一以上），没有编造源码中不存在的函数"
+        },
+        {
+          "text": "源码行为引用与源码文本一致，例如：exception 行由 ata_eh_link_report 打印且含 frozen 后缀逻辑、AC_ERR_TIMEOUT=(1<<2) 对应 Emask 0x4、ahci_hardreset 内调用 sata_link_hardreset 发 COMRESET"
+        },
+        {
+          "text": "报告整体结构完整（源码章 + 分析结论/时间线/根因/排查/信息缺口/最终判断等），且源码章结论回指具体文件与函数"
+        },
+        {
+          "text": "反幻觉：未声称读取了源码树中不存在的文件（如 libata-scsi.c、sata_pmp.c、ahci.c）；若提及这些文件，明确说明它们不在用户提供的源码树中"
+        }
+      ]
+    }
+  ]
+}
