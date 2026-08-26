@@ -5,7 +5,7 @@ description: Generate an image with ChatGPT (GPT image generation) in the user's
 
 # chatgpt-image-gen
 
-Generate an image from a text description with ChatGPT via ego-browser, download it, and save it into the project. The whole happy path is one bundled script; this skill mainly covers how to call it, how to handle login, and how to finish up cleanly.
+Generate image(s) from a text description with ChatGPT via ego-browser, download them, and save them into the project. The whole happy path is one bundled script; this skill mainly covers how to call it, how to handle login, and how to finish up cleanly.
 
 ## Prerequisites
 
@@ -24,12 +24,14 @@ The installed ego lite runtime (0.4.4.x) preloads the **helper API** — `useOrC
 
    ```bash
    bash <this-skill-dir>/scripts/gen-image.sh "<image description>" "<absolute output path>"
+   # or, to save the whole grid instead of just the largest image:
+   bash <this-skill-dir>/scripts/gen-image.sh --all "<image description>" "<absolute output path>"
    ```
 
-   It reuses the task space `chatgpt image generation`, opens a fresh ChatGPT chat, sends the description, polls until the image appears, downloads it with the page's session cookies, and writes the file. Final line of output is a JSON status.
+   It reuses the task space `chatgpt image generation`, opens a fresh ChatGPT chat, sends the description, polls until the image(s) appear, downloads them with the page's session cookies, and writes the file(s). The final line of output is **always a JSON status — including on failure** — so read it before deciding what to do.
 
 3. **Handle the exit code:**
-   - `0` with `{"status":"ok", ...}` — continue to step 4.
+   - `0` with `{"status":"ok", ...}` — `path` (single image) or `paths` (with `--all`) lists the saved file(s). Continue to step 4.
    - `42` (`login_required`) — hand the browser to the user so they can log in:
       ```bash
       ego-browser nodejs <<'EOF'
@@ -40,8 +42,11 @@ The installed ego lite runtime (0.4.4.x) preloads the **helper API** — `useOrC
       ```
       Check `h.done`, then tell the user to log into ChatGPT in the ego lite window and say when done. Only after they confirm, take control back with a new `ego-browser nodejs` heredoc using `takeOverTaskSpace('chatgpt image generation')`, then rerun the generator.
    - `1` with `image_timeout` — generation may still be running; open the conversation URL from the output, check visually with `captureScreenshot()`, and if the image has since appeared, fetch it manually (the poll + download snippet in the script is the reference). Otherwise report the failure.
+   - `1` with `download_failed` — the CDN responded with `http` (status code) or the bytes were not an image (`reason: 'not_an_image'` / `'empty'`). Retry once; if it repeats, report it.
+   - `1` with `internal_error` — the automation itself broke (element not found, CDP hiccup, ...); the JSON includes the underlying `error`. Retry once. If the same selector error repeats, the ChatGPT DOM likely changed — the script's selectors (`#prompt-textarea`, the submit-button fallback list) are the first thing to update.
+   - `1` with `fill_failed` / `submit_not_found` — the page rendered but the expected composer elements were missing; retry once, then treat as a DOM change (see `internal_error`).
 
-4. **Verify the saved image** — check it exists, has non-trivial size, and visually inspect it (e.g. read the image file) to confirm the content matches the description.
+4. **Verify the saved image(s)** — each saved file exists, has non-trivial size (the script already rejects non-image bytes), and visually inspect them (e.g. read the image file) to confirm the content matches the description.
 
 5. **Close the task space** only after verification passed. Use the bundled idempotent cleanup script instead of composing a CLI command or calling `completeTaskSpace` directly:
 
@@ -55,6 +60,6 @@ The installed ego lite runtime (0.4.4.x) preloads the **helper API** — `useOrC
 
 ## Notes
 
-- Each run sends exactly one image request and waits for it. If the user wants several images, rerun the script per description rather than batching prompts in one chat — separate runs keep filenames and failure handling clean.
+- Each run sends exactly one image request. ChatGPT's GPT-4o usually renders a grid of 4: the default saves only the largest, `--all` saves every one as `<name>-1.png` (largest) through `<name>-4.png`, named in descending size order. For several *different* images, rerun the script per description rather than batching prompts in one chat — separate runs keep filenames and failure handling clean.
 - The script opens `https://chatgpt.com/` fresh each run, so every image starts a new chat. The ChatGPT conversation remains in the user's history.
-- Do not retry blindly on transient failure: read the JSON status first, it distinguishes login, timeout, and download problems.
+- Do not retry blindly on transient failure: read the JSON status first — it distinguishes login, timeout, download, and internal problems.
