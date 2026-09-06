@@ -1,12 +1,13 @@
 # skills
 
-自用的 AI Agent 技能（Skills）合集，适用于 Claude Code / Kimi Code 等支持 SKILL.md 规范的 Agent。
+自用的 AI Agent 技能（Skills）合集，适用于 Codex / Claude Code / Kimi Code 等支持 SKILL.md 规范的 Agent。
 
 ## 技能列表
 
 | 技能 | 说明 |
 |---|---|
 | [chatgpt-image-gen](./chatgpt-image-gen) | 通过 ego-browser 驱动已登录的 ChatGPT 生成图片，并自动保存到当前项目目录 |
+| [embedded-device-debugger](./embedded-device-debugger) | 通过 SSH 或串口安全连接嵌入式设备，采集日志、执行诊断命令并分析问题 |
 
 ---
 
@@ -62,3 +63,62 @@ bash chatgpt-image-gen/scripts/gen-image.sh --all "<图片描述>" "<输出文�
 - 脚本基于 ego lite 0.4.4.x 的 helper API（`useOrCreateTaskSpace`、`cliLog` 等），ego lite 大版本升级后如 API 变化可能需要调整
 - ego 内嵌 Node 运行时不继承 shell 环境变量，参数通过 `/tmp/chatgpt-image-gen/` 下的临时文件传递
 - 生成耗时通常 1–5 分钟，取决于 ChatGPT 生图速度
+
+---
+
+## embedded-device-debugger
+
+面向嵌入式 Linux、BusyBox 和串口控制台的跨平台诊断技能，Windows 与 Linux 使用同一套 Python 工具。支持：
+
+- SSH 密钥/Agent 登录、交互登录、自定义端口、严格主机密钥校验和命令超时
+- 串口枚举、限时日志抓取、自动登录、Shell Prompt 识别和批量命令执行
+- JSON 诊断报告、敏感信息脱敏、输出文件防误覆盖
+- 启动、内核、驱动、CPU、内存、存储、网络和服务故障排查手册
+- 默认只读诊断；重启、刷写、配置修改等变更操作需要用户明确授权
+
+### 依赖
+
+- Python 3.9+
+- SSH 功能：系统 OpenSSH 客户端
+- 串口功能：PySerial，按需安装：
+
+```bash
+python -m pip install -r embedded-device-debugger/requirements.txt
+```
+
+Linux 上可将 `python` 替换为 `python3`。
+
+### 安装
+
+```bash
+# Codex
+cp -r embedded-device-debugger ~/.codex/skills/
+
+# Claude Code / Kimi Code 等
+cp -r embedded-device-debugger ~/.agents/skills/
+```
+
+### 使用示例
+
+安装后可直接告诉 Agent：
+
+- “通过 SSH 连接 `root@192.168.1.100:2222`，只读检查设备启动异常”
+- “枚举本机串口，通过 `COM5`、115200 波特率抓取 30 秒启动日志并分析”
+- “通过 `/dev/ttyUSB0` 登录设备，检查内存占用和 OOM 日志”
+
+也可以手动调用工具。SSH 端口通过 `--port` 自定义：
+
+```bash
+python embedded-device-debugger/scripts/device_console.py ssh-run \
+  --host 192.168.1.100 --user root --port 2222 \
+  --command "uname -a" --command "uptime"
+```
+
+串口日志抓取：
+
+```bash
+python embedded-device-debugger/scripts/device_console.py serial-monitor \
+  --port /dev/ttyUSB0 --baud 115200 --duration 30 --output boot.log
+```
+
+完整参数、安全边界及平台配置说明见 [embedded-device-debugger/SKILL.md](./embedded-device-debugger/SKILL.md)。
