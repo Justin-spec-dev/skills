@@ -26,6 +26,11 @@ class ToolError(RuntimeError):
     """An expected, user-actionable tool error."""
 
 
+DEFAULT_PROMPT = (
+    r"(?m)^(?:(?:\[[^\r\n]{1,72}\]|[A-Za-z0-9_.@:/~()\\-]{0,72}) ?[#$>]|=>) ?\Z"
+)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -318,6 +323,9 @@ def timestamped_line(line: str, timestamps: bool) -> str:
 
 
 def command_serial_monitor(args: argparse.Namespace) -> int:
+    secrets = secret_values_from_env(args.redact_env)
+    if any("\r" in secret or "\n" in secret for secret in secrets):
+        raise ToolError("serial-monitor --redact-env values must be single-line secrets.")
     output = prepare_output(args.output, force=args.force, append=args.append)
     connection = None
     decoder = codecs.getincrementaldecoder(args.encoding)(errors="replace")
@@ -326,7 +334,7 @@ def command_serial_monitor(args: argparse.Namespace) -> int:
     last_data = started
 
     def emit(line: str) -> None:
-        rendered = timestamped_line(line, not args.no_timestamps)
+        rendered = timestamped_line(redact(line, secrets), not args.no_timestamps)
         print(rendered, flush=True)
         if output:
             output.write(rendered + "\n")
@@ -376,23 +384,27 @@ class SerialTextReader:
         buffer = self.pending
         self.pending = ""
         deadline = time.monotonic() + timeout
-        while True:
-            matches: list[tuple[int, int, str]] = []
-            for name, pattern in patterns:
-                match = pattern.search(buffer)
-                if match:
-                    matches.append((match.start(), match.end(), name))
-            if matches:
-                _, end, name = min(matches, key=lambda item: (item[0], item[1]))
-                consumed = buffer[:end]
-                self.pending = buffer[end:]
-                return name, consumed
-            if time.monotonic() >= deadline:
-                return None, buffer
-            waiting = getattr(self.connection, "in_waiting", 0)
-            data = self.connection.read(max(1, min(waiting or 1, 65536)))
-            if data:
-                buffer += self.decoder.decode(data)
+        try:
+            while True:
+                matches: list[tuple[int, int, str]] = []
+                for name, pattern in patterns:
+                    match = pattern.search(buffer)
+                    if match:
+                        matches.append((match.start(), match.end(), name))
+                if matches:
+                    _, end, name = min(matches, key=lambda item: (item[0], item[1]))
+                    consumed = buffer[:end]
+                    self.pending = buffer[end:]
+                    return name, consumed
+                if time.monotonic() >= deadline:
+                    return None, buffer
+                waiting = getattr(self.connection, "in_waiting", 0)
+                data = self.connection.read(max(1, min(waiting or 1, 65536)))
+                if data:
+                    buffer += self.decoder.decode(data)
+        except BaseException:
+            self.pending = buffer
+            raise
 
 
 def newline_bytes(name: str) -> bytes:
@@ -433,16 +445,20 @@ def command_serial_run(args: argparse.Namespace) -> int:
     if password:
         secrets.append(password)
 
-    connection = open_serial(args)
-    reader = SerialTextReader(connection, args.encoding)
     newline = newline_bytes(args.newline)
     session_chunks: list[str] = []
     results: list[dict[str, Any]] = []
     logged_in = False
     username_sent = False
     password_sent = False
+    active_prompt = prompt
+    connection = None
+    reader: Optional[SerialTextReader] = None
+    failure: Optional[BaseException] = None
 
     try:
+        connection = open_serial(args)
+        reader = SerialTextReader(connection, args.encoding)
         if args.wake > 0:
             connection.write(newline * args.wake)
             connection.flush()
@@ -458,6 +474,11 @@ def command_serial_run(args: argparse.Namespace) -> int:
             session_chunks.append(chunk)
             if matched == "prompt":
                 logged_in = True
+                if args.prompt == DEFAULT_PROMPT:
+                    observed_matches = list(prompt.finditer(chunk))
+                    if observed_matches:
+                        observed = observed_matches[-1].group(0)
+                        active_prompt = re.compile(r"(?m)^" + re.escape(observed) + r"\Z")
                 break
             if matched == "login":
                 if not args.username:
@@ -489,7 +510,7 @@ def command_serial_run(args: argparse.Namespace) -> int:
             started = time.monotonic()
             connection.write(wire.encode(args.encoding) + newline)
             connection.flush()
-            matched, output = reader.read_until_any([("prompt", prompt)], args.timeout)
+            matched, output = reader.read_until_any([("prompt", active_prompt)], args.timeout)
             exit_code: Optional[int] = None
             if marker:
                 matches = re.findall(re.escape(marker) + r"(-?\d+)", output)
@@ -508,8 +529,15 @@ def command_serial_run(args: argparse.Namespace) -> int:
                 break
             if exit_code not in (0, None) and not args.continue_on_error:
                 break
+    except (Exception, KeyboardInterrupt) as exc:
+        failure = exc
     finally:
-        connection.close()
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
 
     report = {
         "tool": "device-console",
@@ -520,6 +548,31 @@ def command_serial_run(args: argparse.Namespace) -> int:
         "session": redact("".join(session_chunks), secrets),
         "results": results,
     }
+    if failure is not None:
+        error = {
+            "type": type(failure).__name__,
+            "message": redact(str(failure), secrets),
+        }
+        if reader is not None and reader.pending:
+            error["partial_output"] = redact(reader.pending, secrets)
+        report["error"] = error
+
+        try:
+            write_json_artifact(args.output, report, force=args.force)
+            if args.json:
+                emit_json(report)
+        except Exception as evidence_error:
+            try:
+                print(
+                    f"device-console: failed to preserve partial report: {evidence_error}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+        if isinstance(failure, KeyboardInterrupt):
+            return 130
+        raise failure.with_traceback(failure.__traceback__)
+
     write_json_artifact(args.output, report, force=args.force)
 
     if args.json:
@@ -613,6 +666,7 @@ def build_parser() -> argparse.ArgumentParser:
     serial_monitor.add_argument("--idle-timeout", type=float, default=0, help="Stop after this many idle seconds")
     serial_monitor.add_argument("--timeout", type=float, default=2, help="Serial write timeout basis")
     serial_monitor.add_argument("--no-timestamps", action="store_true")
+    serial_monitor.add_argument("--redact-env", action="append", default=[], metavar="NAME")
     add_output_guard_arguments(serial_monitor, append=True)
     serial_monitor.set_defaults(func=command_serial_monitor)
 
@@ -628,7 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt for a password without echo; requires an interactive terminal",
     )
     serial_run.add_argument("--redact-env", action="append", default=[], metavar="NAME")
-    serial_run.add_argument("--prompt", default=r"(?m)^[^\r\n]{0,80}[#$>] ?$")
+    serial_run.add_argument("--prompt", default=DEFAULT_PROMPT)
     serial_run.add_argument(
         "--login-prompt",
         default=r"(?im)^(?:[A-Za-z0-9_.-]+\s+)?(?:login|username):\s*$",

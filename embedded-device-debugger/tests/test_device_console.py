@@ -1,5 +1,7 @@
 import argparse
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -56,6 +58,47 @@ class DeviceConsoleTests(unittest.TestCase):
         self.assertEqual((name, first), ("login", "login:"))
         name, second = reader.read_until_any([("prompt", device_console.re.compile(r"\$ "))], 0.1)
         self.assertEqual((name, second), ("prompt", "rest$ "))
+
+    def test_default_prompt_rejects_xml_like_output(self):
+        prompt = device_console.re.compile(device_console.DEFAULT_PROMPT)
+        self.assertIsNone(prompt.search("<status>"))
+        self.assertIsNone(prompt.search("status>\r\nstill producing output"))
+        for value in ("root@board:~# ", "/ # ", "router(config)#", "=> "):
+            with self.subTest(value=value):
+                self.assertIsNotNone(prompt.search(value))
+
+    def test_serial_run_pins_the_observed_default_prompt(self):
+        fake = FakeSerial(
+            [
+                b"root@board:~# ",
+                b"status>",
+                b"\r\nhealthy\r\nroot@board:~# ",
+            ]
+        )
+        fake.writes = []
+        fake.write = lambda value: fake.writes.append(value)
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--no-login",
+                "--wake",
+                "0",
+                "--command",
+                "show health",
+                "--json",
+            ]
+        )
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            with mock.patch.object(device_console, "emit_json") as emit_json:
+                result = device_console.command_serial_run(args)
+        self.assertEqual(result, 0)
+        report = emit_json.call_args.args[0]
+        self.assertFalse(report["results"][0]["timed_out"])
+        self.assertIn("status>\r\nhealthy", report["results"][0]["output"])
 
     def test_posix_shell_wire_command_has_unique_exit_marker(self):
         wire, marker = device_console.wire_command("uname -a", "posix-shell")
@@ -123,6 +166,163 @@ class DeviceConsoleTests(unittest.TestCase):
         self.assertNotIn("s3cr3t", device_console.json.dumps(report))
         self.assertIn("<REDACTED>", report["session"])
         self.assertIn(b"s3cr3t\n", fake.writes)
+
+    def test_serial_monitor_redacts_environment_secrets(self):
+        fake = FakeSerial([b"token=s3cr3t\n"])
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-monitor",
+                "--port",
+                "COM9",
+                "--duration",
+                "1",
+                "--no-timestamps",
+                "--redact-env",
+                "DEVICE_TOKEN",
+            ]
+        )
+        with mock.patch.dict(device_console.os.environ, {"DEVICE_TOKEN": "s3cr3t"}):
+            with mock.patch.object(device_console, "open_serial", return_value=fake):
+                with mock.patch.object(device_console.time, "monotonic", side_effect=[0, 0, 0, 2]):
+                    with mock.patch("builtins.print") as print_output:
+                        result = device_console.command_serial_monitor(args)
+        self.assertEqual(result, 0)
+        rendered = "\n".join(str(call.args[0]) for call in print_output.call_args_list)
+        self.assertNotIn("s3cr3t", rendered)
+        self.assertIn("token=<REDACTED>", rendered)
+
+    def test_serial_monitor_rejects_multiline_secrets_before_connecting(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-monitor",
+                "--port",
+                "COM9",
+                "--redact-env",
+                "MULTILINE_SECRET",
+            ]
+        )
+        with mock.patch.dict(device_console.os.environ, {"MULTILINE_SECRET": "first\nsecond"}):
+            with mock.patch.object(device_console, "open_serial", side_effect=RuntimeError("opened")) as open_serial:
+                with self.assertRaisesRegex(device_console.ToolError, "single-line"):
+                    device_console.command_serial_monitor(args)
+        open_serial.assert_not_called()
+
+    def test_serial_run_writes_partial_report_on_error(self):
+        fake = FakeSerial([b"root# "])
+        fake.write = mock.Mock(side_effect=OSError("serial write failed"))
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            args = device_console.build_parser().parse_args(
+                [
+                    "serial-run",
+                    "--port",
+                    "COM9",
+                    "--no-login",
+                    "--wake",
+                    "0",
+                    "--command",
+                    "uname -a",
+                    "--output",
+                    str(output),
+                ]
+            )
+            with mock.patch.object(device_console, "open_serial", return_value=fake):
+                with mock.patch("builtins.print"):
+                    with self.assertRaisesRegex(OSError, "serial write failed"):
+                        device_console.command_serial_run(args)
+            report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(report["session"], "root# ")
+        self.assertEqual(report["results"], [])
+        self.assertEqual(report["error"]["type"], "OSError")
+        self.assertEqual(report["error"]["message"], "serial write failed")
+
+    def test_serial_run_preserves_inflight_output_on_read_error(self):
+        fake = FakeSerial([])
+        fake.read = mock.Mock(
+            side_effect=[b"root# ", b"token=s3cr3t", OSError("serial disconnected")]
+        )
+        fake.write = lambda _value: None
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            args = device_console.build_parser().parse_args(
+                [
+                    "serial-run",
+                    "--port",
+                    "COM9",
+                    "--no-login",
+                    "--wake",
+                    "0",
+                    "--command",
+                    "dmesg",
+                    "--redact-env",
+                    "DEVICE_TOKEN",
+                    "--output",
+                    str(output),
+                ]
+            )
+            with mock.patch.dict(device_console.os.environ, {"DEVICE_TOKEN": "s3cr3t"}):
+                with mock.patch.object(device_console, "open_serial", return_value=fake):
+                    with mock.patch("builtins.print"):
+                        with self.assertRaisesRegex(OSError, "serial disconnected"):
+                            device_console.command_serial_run(args)
+            report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(report["error"]["partial_output"], "token=<REDACTED>")
+
+    def test_partial_report_failure_does_not_mask_serial_error(self):
+        fake = FakeSerial([b"root# "])
+        fake.write = mock.Mock(side_effect=OSError("serial write failed"))
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--no-login",
+                "--wake",
+                "0",
+                "--command",
+                "uname -a",
+            ]
+        )
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            with mock.patch.object(
+                device_console, "write_json_artifact", side_effect=OSError("disk full")
+            ):
+                with mock.patch("builtins.print"):
+                    with self.assertRaisesRegex(OSError, "serial write failed"):
+                        device_console.command_serial_run(args)
+
+    def test_ssh_timeout_is_reported_and_redacted(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "ssh-run",
+                "--host",
+                "192.0.2.2",
+                "--command",
+                "collect logs",
+                "--redact-env",
+                "DEVICE_TOKEN",
+                "--json",
+            ]
+        )
+        timeout = device_console.subprocess.TimeoutExpired(
+            cmd="ssh", timeout=30, output=b"partial s3cr3t", stderr=b"timed out"
+        )
+        with mock.patch.dict(device_console.os.environ, {"DEVICE_TOKEN": "s3cr3t"}):
+            with mock.patch.object(device_console.shutil, "which", return_value="ssh"):
+                with mock.patch.object(device_console.subprocess, "run", side_effect=timeout):
+                    with mock.patch.object(device_console, "emit_json") as emit_json:
+                        result = device_console.command_ssh_run(args)
+        self.assertEqual(result, 124)
+        report = emit_json.call_args.args[0]
+        self.assertTrue(report["results"][0]["timed_out"])
+        self.assertEqual(report["results"][0]["stdout"], "partial <REDACTED>")
 
     def test_negative_timeout_is_rejected(self):
         args = argparse.Namespace(timeout=-1)

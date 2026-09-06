@@ -31,10 +31,11 @@ Use `python3` where `python` is not the Python 3 launcher. Run `--help` on a com
 
 - `ssh-run` is non-interactive and expects a key or SSH agent. Use `ssh-shell` in a PTY when the user must complete an interactive password or MFA prompt.
 - SSH host-key checking is strict by default. Use `--host-key-policy accept-new` only after the user identifies this as a first connection and the expected fingerprint has been verified out of band. Never disable host-key verification.
-- Supply serial login passwords through `--password-env`, or use `--ask-password` in a PTY so the user can type it without echo. Never put a password in a command argument, chat message, transcript, or saved artifact. Use `--redact-env` for other known secrets.
+- Supply serial login passwords through `--password-env`, or use `--ask-password` in a PTY so the user can type it without echo. Never put a password in a command argument, chat message, transcript, or saved artifact. Use repeatable `--redact-env NAME` options with `ssh-run`, `serial-monitor`, or `serial-run` for other known secrets. Because monitor output is emitted line by line, `serial-monitor` rejects selected secret values containing CR or LF before connecting.
 - Use bounded `--duration` and `--timeout` values for AI-driven work. Do not leave monitors or shells running after collecting the needed evidence.
 - The serial helper defaults DTR and RTS to `off`. Opening a serial port can still affect hardware with reset/boot wiring; warn the user before connecting when those lines are known to be sensitive.
-- Save evidence with `--output` when analysis spans multiple checks. The tool refuses to overwrite an existing file unless `--force` is explicitly supplied.
+- The default serial prompt matcher recognizes common uncolored shell, BusyBox, network-device, and bootloader prompts, then pins the first observed prompt for the rest of the session. Supply a narrow `--prompt` regex for colored, dynamic, or unusual prompts.
+- Save evidence with `--output` when analysis spans multiple checks. The tool refuses to overwrite an existing file unless `--force` is explicitly supplied, and `serial-run` writes captured partial evidence plus an `error` field if the session fails. A read failure includes the in-flight data as `error.partial_output` when available.
 - If network, device-node, or sandbox access is denied, request the required execution permission instead of weakening the host or device security configuration.
 
 ## Authorization boundary
