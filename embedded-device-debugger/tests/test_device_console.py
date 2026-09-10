@@ -292,7 +292,7 @@ class DeviceConsoleTests(unittest.TestCase):
         )
         with mock.patch.object(device_console, "open_serial", return_value=fake):
             with mock.patch.object(
-                device_console, "write_json_artifact", side_effect=OSError("disk full")
+                device_console, "write_json_report", side_effect=OSError("disk full")
             ):
                 with mock.patch("builtins.print"):
                     with self.assertRaisesRegex(OSError, "serial write failed"):
@@ -328,6 +328,374 @@ class DeviceConsoleTests(unittest.TestCase):
         args = argparse.Namespace(timeout=-1)
         with self.assertRaises(device_console.ToolError):
             device_console.validate_arguments(args)
+
+    # --- redaction guards ---
+
+    def test_redact_env_missing_variable_is_reported(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "ssh-run",
+                "--host",
+                "192.0.2.2",
+                "--command",
+                "uname -a",
+                "--redact-env",
+                "MISSING_DEVICE_TOKEN",
+            ]
+        )
+        with mock.patch.dict(device_console.os.environ, {}, clear=True):
+            with mock.patch.object(device_console.subprocess, "run") as run:
+                with self.assertRaisesRegex(device_console.ToolError, "not set or empty"):
+                    device_console.command_ssh_run(args)
+        run.assert_not_called()
+
+    def test_redact_env_short_secret_is_rejected(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "ssh-run",
+                "--host",
+                "192.0.2.2",
+                "--command",
+                "uname -a",
+                "--redact-env",
+                "SHORT_TOKEN",
+            ]
+        )
+        with mock.patch.dict(device_console.os.environ, {"SHORT_TOKEN": "8"}):
+            with mock.patch.object(device_console.subprocess, "run") as run:
+                with self.assertRaisesRegex(device_console.ToolError, "shorter than"):
+                    device_console.command_ssh_run(args)
+        run.assert_not_called()
+
+    def test_ssh_run_rejects_multiline_secret_before_connecting(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "ssh-run",
+                "--host",
+                "192.0.2.2",
+                "--command",
+                "uname -a",
+                "--redact-env",
+                "MULTILINE_SECRET",
+            ]
+        )
+        with mock.patch.dict(device_console.os.environ, {"MULTILINE_SECRET": "first\nsecond"}):
+            with mock.patch.object(device_console.subprocess, "run") as run:
+                with self.assertRaisesRegex(device_console.ToolError, "single-line"):
+                    device_console.command_ssh_run(args)
+        run.assert_not_called()
+
+    def test_redact_treats_secret_as_literal_text(self):
+        # A secret containing regex metacharacters must be replaced literally.
+        text = device_console.redact("value=a.b(c) end", ["a.b(c)"])
+        self.assertEqual(text, "value=<REDACTED> end")
+
+    # --- exit-code correctness ---
+
+    def test_serial_run_reports_unknown_exit_code_when_marker_is_lost(self):
+        fake = FakeSerial([b"root# ", b"\r\nstill running...\r\nroot# "])
+        fake.write = lambda _value: None
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--no-login",
+                "--wake",
+                "0",
+                "--mode",
+                "posix-shell",
+                "--command",
+                "uname -a",
+                "--json",
+            ]
+        )
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            with mock.patch.object(device_console, "emit_json") as emit_json:
+                result = device_console.command_serial_run(args)
+        # A lost marker must never read as success.
+        self.assertEqual(result, 125)
+        item = emit_json.call_args.args[0]["results"][0]
+        self.assertFalse(item["exit_code_known"])
+        self.assertIsNone(item["exit_code"])
+        self.assertIn("exit marker not observed", item["exit_code_note"])
+
+    def test_serial_run_resolves_exit_code_from_marker(self):
+        marker = "__DEVICE_CONSOLE_RC_fixed__:"
+        # Prompt first, then output carrying the wrapper's exit marker.
+        fake = FakeSerial([b"root# ", b"\r\nLinux test\r\n" + f"{marker}7".encode() + b"\r\nroot# "])
+        fake.write = lambda _value: None
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--no-login",
+                "--wake",
+                "0",
+                "--mode",
+                "posix-shell",
+                "--command",
+                "false",
+                "--json",
+            ]
+        )
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            with mock.patch.object(device_console, "wire_command", return_value=("wrapped", marker)):
+                with mock.patch.object(device_console, "emit_json") as emit_json:
+                    result = device_console.command_serial_run(args)
+        self.assertEqual(result, 1)
+        item = emit_json.call_args.args[0]["results"][0]
+        self.assertTrue(item["exit_code_known"])
+        self.assertEqual(item["exit_code"], 7)
+
+    def test_serial_run_raw_mode_does_not_claim_unknown_exit(self):
+        fake = FakeSerial([b"root# ", b"\r\nLinux test\r\nroot# "])
+        fake.write = lambda _value: None
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--no-login",
+                "--wake",
+                "0",
+                "--command",
+                "uname -a",
+                "--json",
+            ]
+        )
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            with mock.patch.object(device_console, "emit_json") as emit_json:
+                result = device_console.command_serial_run(args)
+        self.assertEqual(result, 0)
+        item = emit_json.call_args.args[0]["results"][0]
+        self.assertFalse(item["exit_code_known"])
+        self.assertNotIn("exit_code_note", item)
+
+    # --- login budget ---
+
+    def test_serial_run_reports_login_budget_in_timeout_error(self):
+        fake = FakeSerial([])
+        fake.write = lambda _value: None
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--no-login",
+                "--wake",
+                "1",
+                "--command",
+                "uname -a",
+                "--login-budget",
+                "1",
+                "--login-timeout",
+                "30",
+            ]
+        )
+        clock = {"now": 0.0}
+
+        def ticking_clock() -> float:
+            clock["now"] += 30.0
+            return clock["now"]
+
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            # Each clock reading jumps 30s, so the first attempt exhausts the
+            # 1s budget (read_until_any consumes one reading for its deadline).
+            with mock.patch.object(device_console.time, "monotonic", ticking_clock):
+                with self.assertRaisesRegex(device_console.ToolError, "login budget of 1s"):
+                    device_console.command_serial_run(args)
+
+    def test_serial_run_clips_each_login_read_to_remaining_budget(self):
+        # Alternating login/password prompts keep the loop alive without
+        # tripping the repeated-prompt guards; each read must be clipped to
+        # what is left of the budget instead of a fresh login-timeout. Real
+        # time is used so the budget actually decreases.
+        fake = FakeSerial([])
+        fake.write = lambda _value: None
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--wake",
+                "0",
+                "--username",
+                "root",
+                "--password-env",
+                "DEVICE_PASSWORD",
+                "--command",
+                "uname -a",
+                "--login-budget",
+                "0.25",
+                "--login-timeout",
+                "0.12",
+            ]
+        )
+        timeouts = []
+        clock = {"now": 0.0}
+        sequence = {0: ("login", "device login:"), 1: ("password", "Password:")}
+
+        def fake_read_until_any(_patterns, timeout):
+            timeouts.append(timeout)
+            clock["now"] += 0.1
+            return sequence[(len(timeouts) - 1) % 2]
+
+        with mock.patch.dict(device_console.os.environ, {"DEVICE_PASSWORD": "s3cr3t"}):
+            with mock.patch.object(device_console, "open_serial", return_value=fake):
+                with mock.patch.object(device_console, "SerialTextReader") as reader_cls:
+                    reader_cls.return_value.read_until_any.side_effect = fake_read_until_any
+                    reader_cls.return_value.pending = ""
+                    with mock.patch.object(
+                        device_console.time, "monotonic", side_effect=lambda: clock["now"]
+                    ):
+                        # A third login prompt trips the repeated-prompt guard, which is
+                        # the correct safety behaviour; what matters here is the clipping.
+                        with self.assertRaises(device_console.ToolError):
+                            device_console.command_serial_run(args)
+        self.assertEqual(len(timeouts), 3)
+        self.assertEqual(timeouts[:2], [0.12, 0.12])
+        # The last attempt is clipped to the ~0.05s left, not a fresh 0.12s.
+        self.assertAlmostEqual(timeouts[2], 0.05, places=6)
+
+    # --- timeout transparency ---
+
+    def test_ssh_timeout_marks_remote_command_as_possibly_running(self):
+        args = device_console.build_parser().parse_args(
+            ["ssh-run", "--host", "192.0.2.2", "--command", "dmesg -w", "--json"]
+        )
+        timeout = device_console.subprocess.TimeoutExpired(cmd="ssh", timeout=30, output=b"", stderr=b"")
+        with mock.patch.object(device_console.shutil, "which", return_value="ssh"):
+            with mock.patch.object(device_console.subprocess, "run", side_effect=timeout):
+                with mock.patch.object(device_console, "emit_json") as emit_json:
+                    result = device_console.command_ssh_run(args)
+        self.assertEqual(result, 124)
+        self.assertTrue(emit_json.call_args.args[0]["results"][0]["remote_may_still_run"])
+
+    # --- CLI symmetry (P5) ---
+
+    def test_serial_monitor_emits_json_report(self):
+        fake = FakeSerial([b"boot: ok\n"])
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-monitor",
+                "--port",
+                "COM9",
+                "--duration",
+                "1",
+                "--no-timestamps",
+                "--json",
+            ]
+        )
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            with mock.patch.object(device_console, "emit_json") as emit_json:
+                result = device_console.command_serial_monitor(args)
+        self.assertEqual(result, 0)
+        report = emit_json.call_args.args[0]
+        self.assertEqual(report["transport"], "serial-monitor")
+        self.assertEqual(report["baud"], 115200)
+        self.assertFalse(report["interrupted"])
+        lines = [record["line"] for record in report["lines"]]
+        self.assertIn("boot: ok", lines)
+        self.assertTrue(any(line.startswith("# opened COM9") for line in lines))
+
+    def test_ssh_run_supports_append(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "ssh-run",
+                "--host",
+                "192.0.2.2",
+                "--command",
+                "uname -a",
+                "--output",
+                "report.jsonl",
+                "--append",
+            ]
+        )
+        completed = device_console.subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=b"Linux\n", stderr=b""
+        )
+        with mock.patch.object(device_console.shutil, "which", return_value="ssh"):
+            with mock.patch.object(device_console.subprocess, "run", return_value=completed):
+                with mock.patch.object(device_console, "write_json_report") as write_json_report:
+                    result = device_console.command_ssh_run(args)
+        self.assertEqual(result, 0)
+        self.assertTrue(write_json_report.call_args.kwargs["append"])
+
+    def test_append_and_json_are_mutually_exclusive(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--command",
+                "uname -a",
+                "--json",
+                "--append",
+            ]
+        )
+        with self.assertRaisesRegex(device_console.ToolError, "mutually exclusive"):
+            device_console.validate_arguments(args)
+
+    def test_ssh_port_error_names_the_subcommand(self):
+        args = device_console.build_parser().parse_args(
+            ["ssh-run", "--host", "192.0.2.2", "--port", "70000", "--command", "uname -a"]
+        )
+        with self.assertRaisesRegex(device_console.ToolError, "SSH --port must be between 1 and 65535"):
+            device_console.validate_arguments(args)
+
+    # --- doctor prerequisite reporting (P10) ---
+
+    def test_doctor_reports_missing_prerequisites_with_next_step(self):
+        args = device_console.build_parser().parse_args(["doctor", "--json"])
+        with mock.patch.object(device_console.shutil, "which", return_value=None):
+            with mock.patch.object(device_console.importlib.util, "find_spec", return_value=None):
+                with mock.patch.object(device_console, "emit_json") as emit_json:
+                    result = device_console.command_doctor(args)
+        self.assertEqual(result, 2)
+        report = emit_json.call_args.args[0]
+        self.assertFalse(report["ok"])
+        self.assertEqual(len(report["missing"]), 2)
+        self.assertIn("platform-setup.md", report["next_step"])
+
+    def test_doctor_ok_when_prerequisites_present(self):
+        args = device_console.build_parser().parse_args(["doctor", "--json"])
+        with mock.patch.object(device_console.shutil, "which", return_value="/usr/bin/ssh"):
+            with mock.patch.object(device_console.importlib.util, "find_spec", return_value=object()):
+                with mock.patch.object(device_console, "load_pyserial") as load_pyserial:
+                    load_pyserial.return_value = (
+                        type("S", (), {"VERSION": "3.5"})(),
+                        type("L", (), {"comports": staticmethod(list)})(),
+                    )
+                    with mock.patch.object(device_console, "emit_json") as emit_json:
+                        result = device_console.command_doctor(args)
+        self.assertEqual(result, 0)
+        report = emit_json.call_args.args[0]
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["missing"], [])
+
+    def test_doctor_text_output_lists_missing_prerequisites(self):
+        args = device_console.build_parser().parse_args(["doctor"])
+        with mock.patch.object(device_console.shutil, "which", return_value=None):
+            with mock.patch.object(device_console.importlib.util, "find_spec", return_value=None):
+                with mock.patch("builtins.print") as print_output:
+                    result = device_console.command_doctor(args)
+        self.assertEqual(result, 2)
+        rendered = "\n".join(str(call.args[0]) for call in print_output.call_args_list)
+        self.assertIn("Missing prerequisites:", rendered)
+        self.assertIn("platform-setup.md", rendered)
 
 
 if __name__ == "__main__":

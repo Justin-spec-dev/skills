@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
-"""Cross-platform SSH and serial helper for embedded-device diagnostics."""
+"""Cross-platform SSH and serial helper for embedded-device diagnostics.
+
+Exit codes (interpret them; do not assume 0 just because output exists):
+
+    0    every command ran and every observed exit code was 0
+    1    a command ran but reported a non-zero exit code
+    2    usage error, invalid arguments, or a refused safety guard
+         (e.g. an unset/over-short ``--redact-env``, or an output file that
+         already exists without ``--force``)
+    124  a command timed out; an SSH timeout also sets
+         ``remote_may_still_run: true`` on that result
+    125  ``serial-run --mode posix-shell`` finished a command without observing
+         the wrapper's exit marker, so the result is unverified. This is not
+         success; the result carries ``exit_code_known: false``
+    130  the user interrupted the run (``serial-monitor`` / ``serial-run``)
+
+``doctor`` exits 0 when all prerequisites are present and 2 when one is
+missing; in both cases the report lists ``missing`` and ``next_step``.
+``ssh-shell`` is interactive and passes the session's exit status straight
+through, so it has no fixed contract.
+"""
 
 from __future__ import annotations
 
@@ -43,20 +63,53 @@ def decode_bytes(value: Any, encoding: str) -> str:
     return bytes(value).decode(encoding, errors="replace")
 
 
+MIN_SECRET_LENGTH = 4
+
+
 def redact(text: str, secret_values: Iterable[Optional[str]]) -> str:
+    """Replace secret values with a placeholder.
+
+    Secrets are applied longest first so a secret contained in a longer one is
+    fully covered. Patterns are escaped, so a secret is matched literally.
+    """
     result = text
     for secret in sorted({s for s in secret_values if s}, key=len, reverse=True):
-        result = result.replace(secret, "<REDACTED>")
+        result = re.sub(re.escape(secret), "<REDACTED>", result)
     return result
 
 
 def secret_values_from_env(names: Sequence[str]) -> list[str]:
+    """Collect secret values from environment variables.
+
+    Raises when a requested variable is unset or empty instead of silently
+    producing an unredacted report, and rejects values too short to redact
+    without destroying unrelated output.
+    """
     values: list[str] = []
     for name in names:
         value = os.environ.get(name)
-        if value:
-            values.append(value)
+        if not value:
+            raise ToolError(
+                f"--redact-env {name}: environment variable is not set or empty. "
+                "Fix the variable name or unset it and retry."
+            )
+        if len(value) < MIN_SECRET_LENGTH:
+            raise ToolError(
+                f"--redact-env {name}: secret value is shorter than {MIN_SECRET_LENGTH} characters; "
+                "redacting it would corrupt unrelated output. Use a longer secret or remove this option."
+            )
+        values.append(value)
     return values
+
+
+def validate_single_line_secrets(secrets: Iterable[str]) -> None:
+    """Reject secrets containing CR or LF.
+
+    Output is emitted and stored line by line, so a multi-line secret cannot be
+    redacted reliably and its newlines would also reshape the transcript.
+    """
+    if any("\r" in secret or "\n" in secret for secret in secrets):
+        raise ToolError("--redact-env values must be single-line secrets (no CR or LF).")
 
 
 def emit_json(value: Any) -> None:
@@ -80,14 +133,25 @@ def prepare_output(path_value: Optional[str], force: bool, append: bool) -> Opti
     return path.open("a" if append else "w", encoding="utf-8", newline="\n")
 
 
-def write_json_artifact(path_value: Optional[str], value: Any, force: bool) -> None:
+def write_json_report(
+    path_value: Optional[str], value: Any, force: bool, append: bool = False
+) -> None:
+    """Write a JSON report, one complete document per line when appending.
+
+    Appending keeps the file valid JSON Lines: each record is serialized in full
+    before anything is written, so an interrupted run cannot produce a partial
+    line. Serializing before touching the filesystem also means a mid-write
+    failure cannot leave a truncated report that a caller might mistake for
+    complete evidence.
+    """
     if not path_value:
         return
-    handle = prepare_output(path_value, force=force, append=False)
-    assert handle is not None
-    with handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    path = Path(path_value).expanduser()
+    ensure_output_available(path_value, force=force, append=append)
+    payload = json.dumps(value, ensure_ascii=False, indent=None) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a" if append else "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(payload)
 
 
 def load_pyserial():
@@ -144,12 +208,24 @@ def ssh_base_command(args: argparse.Namespace, batch_mode: bool) -> tuple[list[s
 def command_doctor(args: argparse.Namespace) -> int:
     ssh_path = shutil.which("ssh")
     serial_spec = importlib.util.find_spec("serial")
+    missing: list[str] = []
+    if not ssh_path:
+        missing.append("OpenSSH client 'ssh' (required for SSH transports)")
+    if serial_spec is None:
+        missing.append("PySerial (required for serial transports)")
     result: dict[str, Any] = {
         "platform": platform.platform(),
         "python": sys.version.split()[0],
         "python_executable": sys.executable,
         "ssh": {"available": bool(ssh_path), "path": ssh_path},
         "pyserial": {"available": serial_spec is not None},
+        "ok": not missing,
+        "missing": missing,
+        "next_step": (
+            "Read references/platform-setup.md for install steps; install nothing without user approval."
+            if missing
+            else "All prerequisites detected."
+        ),
     }
     if serial_spec is not None:
         try:
@@ -169,13 +245,19 @@ def command_doctor(args: argparse.Namespace) -> int:
         if "serial_ports" in result:
             ports = result["serial_ports"]
             print(f"Serial ports: {', '.join(ports) if ports else 'none detected'}")
-    return 0 if ssh_path or serial_spec is not None else 2
+        if missing:
+            print("Missing prerequisites:")
+            for item in missing:
+                print(f"  - {item}")
+            print("Next: read references/platform-setup.md, then install only with user approval.")
+    return 0 if not missing else 2
 
 
 def command_ssh_run(args: argparse.Namespace) -> int:
-    ensure_output_available(args.output, force=args.force, append=False)
+    ensure_output_available(args.output, force=args.force, append=args.append)
     base, destination = ssh_base_command(args, batch_mode=True)
     secrets = secret_values_from_env(args.redact_env)
+    validate_single_line_secrets(secrets)
     results: list[dict[str, Any]] = []
 
     for remote_command in args.command:
@@ -202,12 +284,15 @@ def command_ssh_run(args: argparse.Namespace) -> int:
                 "stderr": redact(decode_bytes(completed.stderr, args.encoding), secrets),
             }
         except subprocess.TimeoutExpired as exc:
+            # The local ssh client was killed, but the remote command may well
+            # still be running; the timeout is not proof that it stopped.
             item = {
                 "command": remote_command,
                 "started_at": started_at,
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "exit_code": None,
                 "timed_out": True,
+                "remote_may_still_run": True,
                 "stdout": redact(decode_bytes(exc.stdout, args.encoding), secrets),
                 "stderr": redact(decode_bytes(exc.stderr, args.encoding), secrets),
             }
@@ -225,7 +310,7 @@ def command_ssh_run(args: argparse.Namespace) -> int:
         "captured_at": utc_now(),
         "results": results,
     }
-    write_json_artifact(args.output, report, force=args.force)
+    write_json_report(args.output, report, force=args.force, append=args.append)
 
     if args.json:
         emit_json(report)
@@ -324,21 +409,39 @@ def timestamped_line(line: str, timestamps: bool) -> str:
 
 def command_serial_monitor(args: argparse.Namespace) -> int:
     secrets = secret_values_from_env(args.redact_env)
-    if any("\r" in secret or "\n" in secret for secret in secrets):
-        raise ToolError("serial-monitor --redact-env values must be single-line secrets.")
+    validate_single_line_secrets(secrets)
     output = prepare_output(args.output, force=args.force, append=args.append)
     connection = None
     decoder = codecs.getincrementaldecoder(args.encoding)(errors="replace")
     pending = ""
     started = time.monotonic()
+    started_at = utc_now()
     last_data = started
+    records: list[dict[str, Any]] = []
+    interrupted = False
 
     def emit(line: str) -> None:
         rendered = timestamped_line(redact(line, secrets), not args.no_timestamps)
-        print(rendered, flush=True)
+        if args.json:
+            records.append({"timestamp": utc_now(), "line": rendered})
+        else:
+            print(rendered, flush=True)
         if output:
             output.write(rendered + "\n")
             output.flush()
+
+    def build_report() -> dict[str, Any]:
+        return {
+            "tool": "device-console",
+            "transport": "serial-monitor",
+            "target": args.port,
+            "baud": args.baud,
+            "started_at": started_at,
+            "captured_at": utc_now(),
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "interrupted": interrupted,
+            "lines": records,
+        }
 
     try:
         connection = open_serial(args)
@@ -360,16 +463,21 @@ def command_serial_monitor(args: argparse.Namespace) -> int:
                 line, pending = pending.split("\n", 1)
                 emit(line.rstrip("\r"))
     except KeyboardInterrupt:
+        interrupted = True
         emit("# interrupted")
-        return 130
     finally:
+        # Flush the trailing partial line before the report is emitted so the
+        # JSON never omits evidence that was already captured.
         if pending:
             emit(pending.rstrip("\r"))
         if connection is not None:
             connection.close()
         if output:
             output.close()
-    return 0
+
+    if args.json:
+        emit_json(build_report())
+    return 130 if interrupted else 0
 
 
 class SerialTextReader:
@@ -429,6 +537,24 @@ def compile_pattern(label: str, value: str) -> re.Pattern[str]:
         raise ToolError(f"Invalid {label} regex: {exc}") from exc
 
 
+def resolve_serial_exit_code(item: dict[str, Any], marker: Optional[str]) -> None:
+    """Fill in exit_code / exit_code_known for one serial-run result.
+
+    In posix-shell mode the wrapper always prints an exit marker. If it never
+    arrives the command outcome is unknown, and the report must say so instead
+    of silently looking like success.
+    """
+    known = False
+    if marker:
+        matches = re.findall(re.escape(marker) + r"(-?\d+)", item["output"])
+        if matches:
+            item["exit_code"] = int(matches[-1])
+            known = True
+    if not known and not item["timed_out"] and marker:
+        item["exit_code_note"] = "exit marker not observed; command result unknown"
+    item["exit_code_known"] = known
+
+
 def command_serial_run(args: argparse.Namespace) -> int:
     ensure_output_available(args.output, force=args.force, append=False)
     prompt = compile_pattern("prompt", args.prompt)
@@ -469,9 +595,21 @@ def command_serial_run(args: argparse.Namespace) -> int:
         if not args.no_login:
             login_patterns.extend([("login", login_prompt), ("password", password_prompt)])
 
-        for _ in range(8):
-            matched, chunk = reader.read_until_any(login_patterns, args.login_timeout)
+        # Bound the whole login exchange, not just each read: a silent device
+        # must not hold the tool for attempts x login-timeout seconds.
+        budget = args.login_budget
+        saw_output = False
+        while True:
+            if budget <= 0:
+                break
+            attempt_timeout = args.login_timeout if budget is None else min(args.login_timeout, budget)
+            attempt_started = time.monotonic()
+            matched, chunk = reader.read_until_any(login_patterns, attempt_timeout)
+            if budget is not None:
+                budget -= time.monotonic() - attempt_started
             session_chunks.append(chunk)
+            if chunk:
+                saw_output = True
             if matched == "prompt":
                 logged_in = True
                 if args.prompt == DEFAULT_PROMPT:
@@ -498,11 +636,17 @@ def command_serial_run(args: argparse.Namespace) -> int:
                 connection.flush()
                 password_sent = True
                 continue
+            # No login or prompt pattern matched within the remaining budget.
+            # Say what was actually observed rather than guessing at a cause.
             raise ToolError(
-                "Timed out waiting for a shell prompt. Check baud/login settings or provide a narrower --prompt regex."
+                f"No serial prompt matched within the login budget of {args.login_budget:g}s "
+                f"({budget:.1f}s remaining); console output seen: {'yes' if saw_output else 'no'}. "
+                "Check baud/login settings or provide a narrower --prompt regex."
             )
         if not logged_in:
-            raise ToolError("Could not reach a serial shell prompt after login attempts.")
+            raise ToolError(
+                f"Could not reach a serial shell prompt within --login-budget={args.login_budget:g}s."
+            )
 
         for command in args.command:
             wire, marker = wire_command(command, args.mode)
@@ -511,23 +655,19 @@ def command_serial_run(args: argparse.Namespace) -> int:
             connection.write(wire.encode(args.encoding) + newline)
             connection.flush()
             matched, output = reader.read_until_any([("prompt", active_prompt)], args.timeout)
-            exit_code: Optional[int] = None
-            if marker:
-                matches = re.findall(re.escape(marker) + r"(-?\d+)", output)
-                if matches:
-                    exit_code = int(matches[-1])
             item = {
                 "command": command,
                 "started_at": started_at,
                 "duration_seconds": round(time.monotonic() - started, 3),
-                "exit_code": exit_code,
+                "exit_code": None,
                 "timed_out": matched is None,
                 "output": redact(output, secrets),
             }
+            resolve_serial_exit_code(item, marker)
             results.append(item)
             if item["timed_out"] and not args.continue_on_error:
                 break
-            if exit_code not in (0, None) and not args.continue_on_error:
+            if item["exit_code"] not in (0, None) and not args.continue_on_error:
                 break
     except (Exception, KeyboardInterrupt) as exc:
         failure = exc
@@ -544,6 +684,7 @@ def command_serial_run(args: argparse.Namespace) -> int:
         "transport": "serial",
         "target": args.port,
         "baud": args.baud,
+        "mode": args.mode,
         "captured_at": utc_now(),
         "session": redact("".join(session_chunks), secrets),
         "results": results,
@@ -558,7 +699,7 @@ def command_serial_run(args: argparse.Namespace) -> int:
         report["error"] = error
 
         try:
-            write_json_artifact(args.output, report, force=args.force)
+            write_json_report(args.output, report, force=args.force, append=args.append)
             if args.json:
                 emit_json(report)
         except Exception as evidence_error:
@@ -573,7 +714,7 @@ def command_serial_run(args: argparse.Namespace) -> int:
             return 130
         raise failure.with_traceback(failure.__traceback__)
 
-    write_json_artifact(args.output, report, force=args.force)
+    write_json_report(args.output, report, force=args.force, append=args.append)
 
     if args.json:
         emit_json(report)
@@ -586,14 +727,23 @@ def command_serial_run(args: argparse.Namespace) -> int:
             print(f"--- $ {item['command']}")
             if item["output"]:
                 print(item["output"], end="" if item["output"].endswith("\n") else "\n")
-            status = "timeout" if item["timed_out"] else (
-                f"exit={item['exit_code']}" if item["exit_code"] is not None else "prompt received"
-            )
+            if item["timed_out"]:
+                status = "timeout"
+            elif item["exit_code"] is not None:
+                status = f"exit={item['exit_code']}"
+            elif item["exit_code_known"] is False and args.mode == "posix-shell":
+                status = "exit UNKNOWN (marker lost)"
+            else:
+                status = "prompt received"
             print(f"--- {status}; {item['duration_seconds']}s")
 
     if any(item["timed_out"] for item in results):
         return 124
     known_codes = [item["exit_code"] for item in results if item["exit_code"] is not None]
+    # posix-shell wraps every command so it can report a status; a missing status
+    # means the result is unverified and must not be reported as success.
+    if args.mode == "posix-shell" and any(item["exit_code_known"] is False for item in results):
+        return 125
     return 0 if all(code == 0 for code in known_codes) else 1
 
 
@@ -621,12 +771,15 @@ def add_serial_connection_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--encoding", default="utf-8")
 
 
-def add_output_guard_arguments(parser: argparse.ArgumentParser, append: bool = False) -> None:
+def add_output_guard_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", help="Write a transcript/report to this path")
     parser.add_argument("--force", action="store_true", help="Replace an existing output file")
-    if append:
-        parser.add_argument("--append", action="store_true", help="Append to an existing output file")
-        parser.set_defaults(append=False)
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to an existing output file instead of replacing it",
+    )
+    parser.set_defaults(force=False, append=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -667,7 +820,8 @@ def build_parser() -> argparse.ArgumentParser:
     serial_monitor.add_argument("--timeout", type=float, default=2, help="Serial write timeout basis")
     serial_monitor.add_argument("--no-timestamps", action="store_true")
     serial_monitor.add_argument("--redact-env", action="append", default=[], metavar="NAME")
-    add_output_guard_arguments(serial_monitor, append=True)
+    serial_monitor.add_argument("--json", action="store_true", help="Emit a JSON report instead of a text transcript")
+    add_output_guard_arguments(serial_monitor)
     serial_monitor.set_defaults(func=command_serial_monitor)
 
     serial_run = subparsers.add_parser("serial-run", help="Log in and run commands on a serial console")
@@ -691,7 +845,13 @@ def build_parser() -> argparse.ArgumentParser:
     serial_run.add_argument("--no-login", action="store_true", help="Do not react to login/password prompts")
     serial_run.add_argument("--wake", type=int, default=1, help="Newlines sent before waiting for a prompt")
     serial_run.add_argument("--initial-delay", type=float, default=0.2)
-    serial_run.add_argument("--login-timeout", type=float, default=15)
+    serial_run.add_argument("--login-timeout", type=float, default=15, help="Per-read timeout while logging in")
+    serial_run.add_argument(
+        "--login-budget",
+        type=float,
+        default=45,
+        help="Total seconds allowed for the whole login exchange (default: 45)",
+    )
     serial_run.add_argument("--timeout", type=float, default=30, help="Per-command prompt timeout")
     serial_run.add_argument("--newline", choices=("lf", "cr", "crlf"), default="lf")
     serial_run.add_argument("--mode", choices=("raw", "posix-shell"), default="raw")
@@ -704,11 +864,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_arguments(args: argparse.Namespace) -> None:
-    for field in ("timeout", "connect_timeout", "login_timeout", "duration", "idle_timeout", "initial_delay"):
+    for field in (
+        "timeout",
+        "connect_timeout",
+        "login_timeout",
+        "login_budget",
+        "duration",
+        "idle_timeout",
+        "initial_delay",
+    ):
         if hasattr(args, field) and getattr(args, field) < 0:
             raise ToolError(f"--{field.replace('_', '-')} cannot be negative")
     if hasattr(args, "port") and isinstance(args.port, int) and not 1 <= args.port <= 65535:
-        raise ToolError("SSH --port must be between 1 and 65535")
+        if args.subcommand in ("ssh-run", "ssh-shell"):
+            raise ToolError("SSH --port must be between 1 and 65535")
+        raise ToolError(f"{args.subcommand} --port must be between 1 and 65535")
     if hasattr(args, "baud") and args.baud <= 0:
         raise ToolError("--baud must be positive")
     if hasattr(args, "wake") and args.wake < 0:
@@ -719,8 +889,12 @@ def validate_arguments(args: argparse.Namespace) -> None:
         raise ToolError("--timeout must be positive")
     if hasattr(args, "login_timeout") and args.login_timeout == 0:
         raise ToolError("--login-timeout must be positive")
+    if hasattr(args, "login_budget") and args.login_budget == 0:
+        raise ToolError("--login-budget must be positive")
     if getattr(args, "force", False) and getattr(args, "append", False):
         raise ToolError("--force and --append are mutually exclusive")
+    if getattr(args, "json", False) and getattr(args, "append", False):
+        raise ToolError("--json and --append are mutually exclusive; append produces JSON Lines, not one document")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

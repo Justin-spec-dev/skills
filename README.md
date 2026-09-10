@@ -72,9 +72,14 @@ bash chatgpt-image-gen/scripts/gen-image.sh --all "<图片描述>" "<输出文�
 
 - SSH 密钥/Agent 登录、交互登录、自定义端口、严格主机密钥校验和命令超时
 - 串口枚举、限时日志抓取、自动登录、Shell Prompt 识别和批量命令执行
-- JSON 诊断报告、敏感信息脱敏、输出文件防误覆盖
+- JSON 诊断报告（`ssh-run` / `serial-monitor` / `serial-run` 均支持 `--json`）、敏感信息脱敏、输出文件防误覆盖（`--force` / `--append`）
+- 退出码可信度标记：SSH 超时会标注 `remote_may_still_run`，`serial-run --mode posix-shell` 未取到退出码时以 `125` 退出并标记 `exit_code_known: false`，不会把未知结果当成功
 - 启动、内核、驱动、CPU、内存、存储、网络和服务故障排查手册
 - 默认只读诊断；重启、刷写、配置修改等变更操作需要用户明确授权
+
+### 脱敏
+
+`--redact-env NAME` 指定的环境变量若未设置、为空或短于 4 个字符，会在连接前直接报错而不是静默跳过；含 CR/LF 的密钥在所有传输方式下都会被拒绝，因为输出是逐行产生和保存的。
 
 ### 依赖
 
