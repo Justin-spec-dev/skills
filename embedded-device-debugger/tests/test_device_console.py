@@ -79,6 +79,8 @@ class DeviceConsoleTests(unittest.TestCase):
         fake.write = lambda value: fake.writes.append(value)
         fake.flush = lambda: None
         fake.close = lambda: None
+        # raw mode keeps this focused on prompt pinning; exit markers are
+        # covered separately by the posix-shell tests.
         args = device_console.build_parser().parse_args(
             [
                 "serial-run",
@@ -87,6 +89,8 @@ class DeviceConsoleTests(unittest.TestCase):
                 "--no-login",
                 "--wake",
                 "0",
+                "--mode",
+                "raw",
                 "--command",
                 "show health",
                 "--json",
@@ -131,12 +135,13 @@ class DeviceConsoleTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_serial_login_redacts_password_from_report(self):
+        marker = "__DEVICE_CONSOLE_RC_fixed__:"
         fake = FakeSerial(
             [
                 b"device login:",
                 b"Password:",
                 b"s3cr3t\r\nroot# ",
-                b"uname -a\r\nLinux test\r\nroot# ",
+                b"uname -a\r\nLinux test\r\n" + f"{marker}0".encode() + b"\r\nroot# ",
             ]
         )
         fake.writes = []
@@ -159,13 +164,15 @@ class DeviceConsoleTests(unittest.TestCase):
         )
         with mock.patch.dict(device_console.os.environ, {"DEVICE_PASSWORD": "s3cr3t"}):
             with mock.patch.object(device_console, "open_serial", return_value=fake):
-                with mock.patch.object(device_console, "emit_json") as emit_json:
-                    result = device_console.command_serial_run(args)
+                with mock.patch.object(device_console, "wire_command", return_value=("wrapped", marker)):
+                    with mock.patch.object(device_console, "emit_json") as emit_json:
+                        result = device_console.command_serial_run(args)
         self.assertEqual(result, 0)
         report = emit_json.call_args.args[0]
         self.assertNotIn("s3cr3t", device_console.json.dumps(report))
         self.assertIn("<REDACTED>", report["session"])
         self.assertIn(b"s3cr3t\n", fake.writes)
+        self.assertTrue(report["results"][0]["exit_code_known"])
 
     def test_serial_monitor_redacts_environment_secrets(self):
         fake = FakeSerial([b"token=s3cr3t\n"])
@@ -466,6 +473,8 @@ class DeviceConsoleTests(unittest.TestCase):
                 "--no-login",
                 "--wake",
                 "0",
+                "--mode",
+                "raw",
                 "--command",
                 "uname -a",
                 "--json",
@@ -478,6 +487,15 @@ class DeviceConsoleTests(unittest.TestCase):
         item = emit_json.call_args.args[0]["results"][0]
         self.assertFalse(item["exit_code_known"])
         self.assertNotIn("exit_code_note", item)
+
+    def test_serial_run_defaults_to_posix_shell_for_verifiable_exit_codes(self):
+        args = device_console.build_parser().parse_args(
+            ["serial-run", "--port", "COM9", "--command", "uname -a"]
+        )
+        self.assertEqual(args.mode, "posix-shell")
+        wire, marker = device_console.wire_command("uname -a", args.mode)
+        self.assertIsNotNone(marker)
+        self.assertIn("sh -c", wire)
 
     # --- login budget ---
 
@@ -696,6 +714,229 @@ class DeviceConsoleTests(unittest.TestCase):
         rendered = "\n".join(str(call.args[0]) for call in print_output.call_args_list)
         self.assertIn("Missing prerequisites:", rendered)
         self.assertIn("platform-setup.md", rendered)
+
+    # --- serial line configuration (previously untested) ---
+
+    def test_configure_serial_maps_every_cli_option(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "/dev/ttyUSB0",
+                "--baud",
+                "57600",
+                "--bytesize",
+                "7",
+                "--parity",
+                "E",
+                "--stopbits",
+                "2",
+                "--xonxoff",
+                "--rtscts",
+                "--dsrdtr",
+                "--dtr",
+                "on",
+                "--rts",
+                "on",
+                "--timeout",
+                "4",
+                "--command",
+                "uname -a",
+            ]
+        )
+
+        class Sink:
+            pass
+
+        sink = Sink()
+        device_console.configure_serial(sink, args, read_timeout=0.25)
+        self.assertEqual(sink.port, "/dev/ttyUSB0")
+        self.assertEqual(sink.baudrate, 57600)
+        self.assertEqual(sink.bytesize, 7)
+        self.assertEqual(sink.parity, "E")
+        self.assertEqual(sink.stopbits, 2)
+        self.assertEqual(sink.timeout, 0.25)
+        self.assertEqual(sink.write_timeout, 4)
+        self.assertTrue(sink.xonxoff)
+        self.assertTrue(sink.rtscts)
+        self.assertTrue(sink.dsrdtr)
+        self.assertTrue(sink.dtr)
+        self.assertTrue(sink.rts)
+
+    def test_configure_serial_defaults_dtr_and_rts_off(self):
+        args = device_console.build_parser().parse_args(
+            ["serial-run", "--port", "COM9", "--command", "uname -a"]
+        )
+
+        class Sink:
+            pass
+
+        sink = Sink()
+        device_console.configure_serial(sink, args, read_timeout=0.2)
+        # Asserting DTR/RTS on open can reset or halt the target board.
+        self.assertFalse(sink.dtr)
+        self.assertFalse(sink.rts)
+        self.assertFalse(sink.xonxoff)
+        self.assertFalse(sink.rtscts)
+        self.assertEqual(sink.parity, "N")
+        self.assertEqual(sink.bytesize, 8)
+        self.assertEqual(sink.stopbits, 1)
+
+    def test_configure_serial_clamps_write_timeout(self):
+        class Sink:
+            pass
+
+        low = device_console.build_parser().parse_args(
+            ["serial-run", "--port", "COM9", "--timeout", "0.01", "--command", "uname -a"]
+        )
+        sink = Sink()
+        device_console.configure_serial(sink, low, read_timeout=0.2)
+        self.assertEqual(sink.write_timeout, 1.0)
+
+        high = device_console.build_parser().parse_args(
+            ["serial-run", "--port", "COM9", "--timeout", "600", "--command", "uname -a"]
+        )
+        device_console.configure_serial(sink, high, read_timeout=0.2)
+        self.assertEqual(sink.write_timeout, 10.0)
+
+    # --- reader scaling and bounds ---
+
+    def test_reader_rescans_only_the_last_line_for_anchored_patterns(self):
+        positions = []
+
+        class RecordingPattern:
+            """Delegates to a real compiled pattern and records the scan start."""
+
+            def __init__(self, compiled):
+                self.compiled = compiled
+
+            @property
+            def pattern(self):
+                return self.compiled.pattern
+
+            def search(self, text, pos=0, endpos=None):
+                positions.append(pos)
+                return self.compiled.search(text, pos)
+
+        lines = [b"boot line\r\n"] * 4000
+        reader = device_console.SerialTextReader(FakeSerial(lines + [b"root@board:~# "]), "utf-8")
+        anchored = RecordingPattern(device_console.re.compile(device_console.DEFAULT_PROMPT))
+        name, _ = reader.read_until_any([("prompt", anchored)], 5.0)
+        self.assertEqual(name, "prompt")
+        # Without the floor the cursor stays at 0 and every chunk rescans the
+        # whole buffer, which is the quadratic behaviour this guards against.
+        self.assertTrue(positions)
+        self.assertGreater(max(positions), 0)
+
+    def test_reader_bounds_memory_on_flood_output(self):
+        # Realistic line-based flood: a prompt does arrive, so the reader stops.
+        chunk = b"log line without prompt\n" * 170
+        chunks = [chunk] * 60 + [b"root@board:~# "]
+        reader = device_console.SerialTextReader(FakeSerial(chunks), "utf-8")
+        with mock.patch.object(device_console, "MAX_PENDING_CHARS", 1 << 16):
+            name, _ = reader.read_until_any(
+                [("prompt", device_console.re.compile(device_console.DEFAULT_PROMPT))], 5.0
+            )
+        self.assertEqual(name, "prompt")
+        self.assertGreater(reader.dropped_tail_bytes, 0)
+        self.assertLess(reader.dropped_tail_bytes, 60 * 4096)
+
+    def test_dropped_tail_bytes_is_reported(self):
+        chunk = b"log line without prompt\n" * 170
+        fake = FakeSerial([b"root# ", *([chunk] * 60)])
+        fake.write = lambda _value: None
+        fake.flush = lambda: None
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-run",
+                "--port",
+                "COM9",
+                "--no-login",
+                "--wake",
+                "0",
+                "--mode",
+                "raw",
+                "--command",
+                "dmesg",
+                "--max-output",
+                "4096",
+                "--json",
+            ]
+        )
+        # Buffer cap above one chunk so truncation repeats without rescanning a
+        # minimal buffer on every read.
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            with mock.patch.object(device_console, "MAX_PENDING_CHARS", 1 << 12):
+                with mock.patch.object(device_console, "emit_json") as emit_json:
+                    device_console.command_serial_run(args)
+        report = emit_json.call_args.args[0]
+        self.assertGreater(report["dropped_tail_bytes"], 0)
+        item = report["results"][0]
+        self.assertTrue(item["output_truncated"])
+        # A spent capture budget is not a timeout.
+        self.assertFalse(item["timed_out"])
+        self.assertEqual(len(item["output"]), 4096)
+
+    # --- output caps ---
+
+    def test_ssh_run_marks_truncated_output(self):
+        args = device_console.build_parser().parse_args(
+            [
+                "ssh-run",
+                "--host",
+                "192.0.2.2",
+                "--command",
+                "cat /var/log/messages",
+                "--max-output",
+                "10",
+                "--json",
+            ]
+        )
+        completed = device_console.subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=b"x" * 400, stderr=b""
+        )
+        with mock.patch.object(device_console.shutil, "which", return_value="ssh"):
+            with mock.patch.object(device_console.subprocess, "run", return_value=completed):
+                with mock.patch.object(device_console, "emit_json") as emit_json:
+                    result = device_console.command_ssh_run(args)
+        item = emit_json.call_args.args[0]["results"][0]
+        self.assertTrue(item["output_truncated"])
+        self.assertEqual(len(item["stdout"]), 10)
+        self.assertEqual(result, 0)
+
+    def test_serial_monitor_stops_at_max_output(self):
+        fake = FakeSerial([b"line one\n", b"line two\n", b"line three\n", b"line four\n"])
+        fake.close = lambda: None
+        args = device_console.build_parser().parse_args(
+            [
+                "serial-monitor",
+                "--port",
+                "COM9",
+                "--no-timestamps",
+                "--max-output",
+                "12",
+                "--json",
+            ]
+        )
+        with mock.patch.object(device_console, "open_serial", return_value=fake):
+            with mock.patch.object(device_console, "emit_json") as emit_json:
+                device_console.command_serial_monitor(args)
+        report = emit_json.call_args.args[0]
+        self.assertTrue(report["output_truncated"])
+
+    def test_default_max_output_is_positive(self):
+        for subcommand in ("ssh-run", "serial-run", "serial-monitor"):
+            argv = [subcommand]
+            if subcommand == "ssh-run":
+                argv += ["--host", "192.0.2.2", "--command", "uname -a"]
+            else:
+                argv += ["--port", "COM9"]
+                if subcommand == "serial-run":
+                    argv += ["--command", "uname -a"]
+            with self.subTest(subcommand=subcommand):
+                args = device_console.build_parser().parse_args(argv)
+                self.assertGreater(args.max_output, 0)
 
 
 if __name__ == "__main__":

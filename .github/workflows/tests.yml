@@ -1,0 +1,40 @@
+name: skills tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  embedded-device-debugger:
+    name: embedded-device-debugger (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the version SKILL.md promises; 3.13 is a current interpreter.
+        python-version: ["3.9", "3.13"]
+    defaults:
+      run:
+        working-directory: embedded-device-debugger
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The suite is dependency-free: PySerial is imported lazily and mocked,
+      # so nothing needs installing. Keeping it that way keeps CI honest.
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile check
+        run: python -m py_compile scripts/device_console.py
+
+      - name: CLI smoke check
+        run: |
+          python scripts/device_console.py doctor --json > /dev/null
+          python scripts/device_console.py --help > /dev/null
+          python scripts/device_console.py serial-run --help > /dev/null

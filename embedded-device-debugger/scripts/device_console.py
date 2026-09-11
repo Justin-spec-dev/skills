@@ -65,6 +65,16 @@ def decode_bytes(value: Any, encoding: str) -> str:
 
 MIN_SECRET_LENGTH = 4
 
+# Search overlap retained when rescanning: long enough for any human- or
+# CLI-defined prompt regex, short enough that rescans stay cheap.
+SCAN_OVERLAP = 1024
+# Upper bound on buffered, not-yet-matched output. Beyond this the oldest bytes
+# are dropped and counted in dropped_tail_bytes so the report stays honest.
+MAX_PENDING_CHARS = 1 << 20
+# Per-command captured output cap, so one flooding command cannot exhaust memory
+# or bury the evidence an operator actually needs.
+MAX_CAPTURED_CHARS = 1 << 20
+
 
 def redact(text: str, secret_values: Iterable[Optional[str]]) -> str:
     """Replace secret values with a placeholder.
@@ -274,14 +284,23 @@ def command_ssh_run(args: argparse.Namespace) -> int:
                 timeout=args.timeout,
                 check=False,
             )
+            stdout = decode_bytes(completed.stdout, args.encoding)
+            stderr = decode_bytes(completed.stderr, args.encoding)
+            truncated = bool(args.max_output) and (len(stdout) + len(stderr)) > args.max_output
+            if truncated:
+                # Keep the head of each stream: a flooding command otherwise
+                # buries the evidence the operator actually needs.
+                stdout = stdout[: args.max_output]
+                stderr = stderr[: args.max_output]
             item = {
                 "command": remote_command,
                 "started_at": started_at,
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "exit_code": completed.returncode,
                 "timed_out": False,
-                "stdout": redact(decode_bytes(completed.stdout, args.encoding), secrets),
-                "stderr": redact(decode_bytes(completed.stderr, args.encoding), secrets),
+                "output_truncated": truncated,
+                "stdout": redact(stdout, secrets),
+                "stderr": redact(stderr, secrets),
             }
         except subprocess.TimeoutExpired as exc:
             # The local ssh client was killed, but the remote command may well
@@ -298,6 +317,8 @@ def command_ssh_run(args: argparse.Namespace) -> int:
             }
         results.append(item)
         if item["timed_out"] and not args.continue_on_error:
+            break
+        if item.get("output_truncated") and not args.continue_on_error:
             break
         if item["exit_code"] not in (0, None) and not args.continue_on_error:
             break
@@ -380,9 +401,12 @@ def command_serial_ports(args: argparse.Namespace) -> int:
     return 0
 
 
-def open_serial(args: argparse.Namespace, read_timeout: float = 0.2):
-    serial, _ = load_pyserial()
-    connection = serial.Serial()
+def configure_serial(connection: Any, args: argparse.Namespace, read_timeout: float) -> None:
+    """Apply CLI arguments to a PySerial connection object.
+
+    Split out from open_serial so the argument-to-PySerial mapping is testable
+    without touching a real port.
+    """
     connection.port = args.port
     connection.baudrate = args.baud
     connection.bytesize = args.bytesize
@@ -393,8 +417,16 @@ def open_serial(args: argparse.Namespace, read_timeout: float = 0.2):
     connection.xonxoff = args.xonxoff
     connection.rtscts = args.rtscts
     connection.dsrdtr = args.dsrdtr
+    # DTR/RTS default to "off": opening a port with them asserted can reset or
+    # halt the target board.
     connection.dtr = args.dtr == "on"
     connection.rts = args.rts == "on"
+
+
+def open_serial(args: argparse.Namespace, read_timeout: float = 0.2):
+    serial, _ = load_pyserial()
+    connection = serial.Serial()
+    configure_serial(connection, args, read_timeout)
     try:
         connection.open()
     except Exception:
@@ -419,9 +451,13 @@ def command_serial_monitor(args: argparse.Namespace) -> int:
     last_data = started
     records: list[dict[str, Any]] = []
     interrupted = False
+    truncated = False
+    captured_chars = 0
 
     def emit(line: str) -> None:
+        nonlocal captured_chars
         rendered = timestamped_line(redact(line, secrets), not args.no_timestamps)
+        captured_chars += len(rendered) + 1
         if args.json:
             records.append({"timestamp": utc_now(), "line": rendered})
         else:
@@ -440,6 +476,7 @@ def command_serial_monitor(args: argparse.Namespace) -> int:
             "captured_at": utc_now(),
             "duration_seconds": round(time.monotonic() - started, 3),
             "interrupted": interrupted,
+            "output_truncated": truncated,
             "lines": records,
         }
 
@@ -448,6 +485,10 @@ def command_serial_monitor(args: argparse.Namespace) -> int:
         emit(f"# opened {args.port} at {args.baud} baud")
         while True:
             now = time.monotonic()
+            if args.max_output and captured_chars > args.max_output:
+                truncated = True
+                emit(f"# output truncated after {args.max_output} characters")
+                break
             if args.duration > 0 and now - started >= args.duration:
                 break
             if args.idle_timeout > 0 and now - last_data >= args.idle_timeout:
@@ -480,23 +521,55 @@ def command_serial_monitor(args: argparse.Namespace) -> int:
     return 130 if interrupted else 0
 
 
+def has_end_anchor(patterns: Sequence[tuple[str, re.Pattern[str]]]) -> bool:
+    """True when a pattern can only match at the end of the buffer."""
+    return any(re.search(r"\\[Zz]|\$$", pattern.pattern) for _, pattern in patterns)
+
+
+def scan_floor(
+    patterns: Sequence[tuple[str, re.Pattern[str]]], buffer: str, scanned: int
+) -> int:
+    """Lowest index that can still contain the start of a new match.
+
+    With an end-anchored pattern a match must reach the end of the buffer, and
+    no match can span a newline that the pattern requires, so everything before
+    the last newline is irrelevant. Without one, only the SCAN_OVERLAP
+    characters behind the previous cursor need re-examination.
+    """
+    if has_end_anchor(patterns):
+        return buffer.rfind("\n") + 1
+    start = scanned - SCAN_OVERLAP
+    return start if start > 0 else 0
+
+
 class SerialTextReader:
     def __init__(self, connection: Any, encoding: str):
         self.connection = connection
+        self.encoding = encoding
         self.decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
         self.pending = ""
+        self.dropped_tail_bytes = 0
 
     def read_until_any(
-        self, patterns: Sequence[tuple[str, re.Pattern[str]]], timeout: float
+        self,
+        patterns: Sequence[tuple[str, re.Pattern[str]]],
+        timeout: float,
+        capture_limit: int = 0,
     ) -> tuple[Optional[str], str]:
         buffer = self.pending
         self.pending = ""
         deadline = time.monotonic() + timeout
+        # Rescanning the whole buffer on every chunk is quadratic and cost ~13s
+        # for 4 MiB of output, which silently blew the command timeout and
+        # reported finished commands as timed out. scan_floor() keeps each
+        # rescan bounded without changing which match is reported.
+        scanned = 0
         try:
             while True:
                 matches: list[tuple[int, int, str]] = []
+                start = scan_floor(patterns, buffer, scanned)
                 for name, pattern in patterns:
-                    match = pattern.search(buffer)
+                    match = pattern.search(buffer, start)
                     if match:
                         matches.append((match.start(), match.end(), name))
                 if matches:
@@ -504,12 +577,25 @@ class SerialTextReader:
                     consumed = buffer[:end]
                     self.pending = buffer[end:]
                     return name, consumed
+                scanned = len(buffer)
                 if time.monotonic() >= deadline:
+                    return None, buffer
+                # Stop reading as soon as the capture budget is spent: continuing
+                # would only collect bytes the caller will discard anyway.
+                if capture_limit and len(buffer) >= capture_limit:
                     return None, buffer
                 waiting = getattr(self.connection, "in_waiting", 0)
                 data = self.connection.read(max(1, min(waiting or 1, 65536)))
                 if data:
                     buffer += self.decoder.decode(data)
+                    # Bound memory on flood output: keep the search overlap plus the
+                    # unconsumed tail, which still covers any pattern a human or the
+                    # CLI defines. Dropped bytes are reported as dropped_tail_bytes.
+                    if len(buffer) > MAX_PENDING_CHARS:
+                        dropped = len(buffer) - MAX_PENDING_CHARS
+                        self.dropped_tail_bytes += len(buffer[:dropped].encode(self.encoding, "replace"))
+                        buffer = buffer[dropped:]
+                        scanned = max(0, scanned - dropped)
         except BaseException:
             self.pending = buffer
             raise
@@ -555,8 +641,79 @@ def resolve_serial_exit_code(item: dict[str, Any], marker: Optional[str]) -> Non
     item["exit_code_known"] = known
 
 
+def capture_login(
+    reader: SerialTextReader,
+    connection: Any,
+    args: argparse.Namespace,
+    prompt: re.Pattern[str],
+    login_prompt: re.Pattern[str],
+    password_prompt: re.Pattern[str],
+    password: Optional[str],
+    session_chunks: list[str],
+    newline: bytes,
+) -> re.Pattern[str]:
+    """Drive the login exchange and return the prompt pattern to use for commands.
+
+    Raises ToolError when the console never reaches a prompt within
+    --login-budget. The budget bounds the whole exchange, not just one read.
+    """
+    login_patterns = [("prompt", prompt)]
+    if not args.no_login:
+        login_patterns.extend([("login", login_prompt), ("password", password_prompt)])
+
+    budget = args.login_budget
+    saw_output = False
+    username_sent = False
+    password_sent = False
+    active_prompt = prompt
+    while True:
+        if budget <= 0:
+            break
+        attempt_timeout = args.login_timeout if budget is None else min(args.login_timeout, budget)
+        attempt_started = time.monotonic()
+        matched, chunk = reader.read_until_any(login_patterns, attempt_timeout)
+        if budget is not None:
+            budget -= time.monotonic() - attempt_started
+        session_chunks.append(chunk)
+        if chunk:
+            saw_output = True
+        if matched == "prompt":
+            if args.prompt == DEFAULT_PROMPT:
+                observed_matches = list(prompt.finditer(chunk))
+                if observed_matches:
+                    observed = observed_matches[-1].group(0)
+                    active_prompt = re.compile(r"(?m)^" + re.escape(observed) + r"\Z")
+            return active_prompt
+        if matched == "login":
+            if not args.username:
+                raise ToolError("Serial console requested a username; provide --username.")
+            if username_sent:
+                raise ToolError("Serial login prompt repeated after the username was sent.")
+            connection.write(args.username.encode(args.encoding) + newline)
+            connection.flush()
+            username_sent = True
+            continue
+        if matched == "password":
+            if password is None:
+                raise ToolError("Serial console requested a password; provide it through --password-env.")
+            if password_sent:
+                raise ToolError("Serial password prompt repeated after the password was sent.")
+            connection.write(password.encode(args.encoding) + newline)
+            connection.flush()
+            password_sent = True
+            continue
+        # No login or prompt pattern matched within the remaining budget.
+        # Say what was actually observed rather than guessing at a cause.
+        raise ToolError(
+            f"No serial prompt matched within the login budget of {args.login_budget:g}s "
+            f"({budget:.1f}s remaining); console output seen: {'yes' if saw_output else 'no'}. "
+            "Check baud/login settings or provide a narrower --prompt regex."
+        )
+    raise ToolError(f"Could not reach a serial shell prompt within --login-budget={args.login_budget:g}s.")
+
+
 def command_serial_run(args: argparse.Namespace) -> int:
-    ensure_output_available(args.output, force=args.force, append=False)
+    ensure_output_available(args.output, force=args.force, append=args.append)
     prompt = compile_pattern("prompt", args.prompt)
     login_prompt = compile_pattern("login-prompt", args.login_prompt)
     password_prompt = compile_pattern("password-prompt", args.password_prompt)
@@ -568,16 +725,13 @@ def command_serial_run(args: argparse.Namespace) -> int:
     elif args.ask_password:
         password = getpass.getpass("Serial password: ")
     secrets = secret_values_from_env(args.redact_env)
+    validate_single_line_secrets(secrets)
     if password:
         secrets.append(password)
 
     newline = newline_bytes(args.newline)
     session_chunks: list[str] = []
     results: list[dict[str, Any]] = []
-    logged_in = False
-    username_sent = False
-    password_sent = False
-    active_prompt = prompt
     connection = None
     reader: Optional[SerialTextReader] = None
     failure: Optional[BaseException] = None
@@ -591,62 +745,17 @@ def command_serial_run(args: argparse.Namespace) -> int:
         if args.initial_delay:
             time.sleep(args.initial_delay)
 
-        login_patterns = [("prompt", prompt)]
-        if not args.no_login:
-            login_patterns.extend([("login", login_prompt), ("password", password_prompt)])
-
-        # Bound the whole login exchange, not just each read: a silent device
-        # must not hold the tool for attempts x login-timeout seconds.
-        budget = args.login_budget
-        saw_output = False
-        while True:
-            if budget <= 0:
-                break
-            attempt_timeout = args.login_timeout if budget is None else min(args.login_timeout, budget)
-            attempt_started = time.monotonic()
-            matched, chunk = reader.read_until_any(login_patterns, attempt_timeout)
-            if budget is not None:
-                budget -= time.monotonic() - attempt_started
-            session_chunks.append(chunk)
-            if chunk:
-                saw_output = True
-            if matched == "prompt":
-                logged_in = True
-                if args.prompt == DEFAULT_PROMPT:
-                    observed_matches = list(prompt.finditer(chunk))
-                    if observed_matches:
-                        observed = observed_matches[-1].group(0)
-                        active_prompt = re.compile(r"(?m)^" + re.escape(observed) + r"\Z")
-                break
-            if matched == "login":
-                if not args.username:
-                    raise ToolError("Serial console requested a username; provide --username.")
-                if username_sent:
-                    raise ToolError("Serial login prompt repeated after the username was sent.")
-                connection.write(args.username.encode(args.encoding) + newline)
-                connection.flush()
-                username_sent = True
-                continue
-            if matched == "password":
-                if password is None:
-                    raise ToolError("Serial console requested a password; provide it through --password-env.")
-                if password_sent:
-                    raise ToolError("Serial password prompt repeated after the password was sent.")
-                connection.write(password.encode(args.encoding) + newline)
-                connection.flush()
-                password_sent = True
-                continue
-            # No login or prompt pattern matched within the remaining budget.
-            # Say what was actually observed rather than guessing at a cause.
-            raise ToolError(
-                f"No serial prompt matched within the login budget of {args.login_budget:g}s "
-                f"({budget:.1f}s remaining); console output seen: {'yes' if saw_output else 'no'}. "
-                "Check baud/login settings or provide a narrower --prompt regex."
-            )
-        if not logged_in:
-            raise ToolError(
-                f"Could not reach a serial shell prompt within --login-budget={args.login_budget:g}s."
-            )
+        active_prompt = capture_login(
+            reader,
+            connection,
+            args,
+            prompt,
+            login_prompt,
+            password_prompt,
+            password,
+            session_chunks,
+            newline,
+        )
 
         for command in args.command:
             wire, marker = wire_command(command, args.mode)
@@ -654,18 +763,28 @@ def command_serial_run(args: argparse.Namespace) -> int:
             started = time.monotonic()
             connection.write(wire.encode(args.encoding) + newline)
             connection.flush()
-            matched, output = reader.read_until_any([("prompt", active_prompt)], args.timeout)
+            matched, output = reader.read_until_any(
+                [("prompt", active_prompt)], args.timeout, capture_limit=args.max_output
+            )
+            truncated = bool(args.max_output) and len(output) >= args.max_output
+            if truncated:
+                output = output[: args.max_output]
             item = {
                 "command": command,
                 "started_at": started_at,
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "exit_code": None,
-                "timed_out": matched is None,
+                # Hitting the capture cap is not a timeout: the prompt simply was
+                # not reached before the budget was spent.
+                "timed_out": matched is None and not truncated,
+                "output_truncated": truncated,
                 "output": redact(output, secrets),
             }
             resolve_serial_exit_code(item, marker)
             results.append(item)
             if item["timed_out"] and not args.continue_on_error:
+                break
+            if truncated and not args.continue_on_error:
                 break
             if item["exit_code"] not in (0, None) and not args.continue_on_error:
                 break
@@ -689,6 +808,8 @@ def command_serial_run(args: argparse.Namespace) -> int:
         "session": redact("".join(session_chunks), secrets),
         "results": results,
     }
+    if reader is not None and reader.dropped_tail_bytes:
+        report["dropped_tail_bytes"] = reader.dropped_tail_bytes
     if failure is not None:
         error = {
             "type": type(failure).__name__,
@@ -782,6 +903,19 @@ def add_output_guard_arguments(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(force=False, append=False)
 
 
+def add_max_output_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-output",
+        type=int,
+        default=MAX_CAPTURED_CHARS,
+        metavar="CHARS",
+        help=(
+            "Stop collecting a command's output after this many characters and mark it "
+            f"truncated (default: {MAX_CAPTURED_CHARS}; 0 disables the cap)"
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="device-console",
@@ -802,6 +936,7 @@ def build_parser() -> argparse.ArgumentParser:
     ssh_run.add_argument("--redact-env", action="append", default=[], metavar="NAME")
     ssh_run.add_argument("--json", action="store_true")
     add_output_guard_arguments(ssh_run)
+    add_max_output_argument(ssh_run)
     ssh_run.set_defaults(func=command_ssh_run)
 
     ssh_shell = subparsers.add_parser("ssh-shell", help="Open an interactive OpenSSH session")
@@ -822,6 +957,7 @@ def build_parser() -> argparse.ArgumentParser:
     serial_monitor.add_argument("--redact-env", action="append", default=[], metavar="NAME")
     serial_monitor.add_argument("--json", action="store_true", help="Emit a JSON report instead of a text transcript")
     add_output_guard_arguments(serial_monitor)
+    add_max_output_argument(serial_monitor)
     serial_monitor.set_defaults(func=command_serial_monitor)
 
     serial_run = subparsers.add_parser("serial-run", help="Log in and run commands on a serial console")
@@ -854,10 +990,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serial_run.add_argument("--timeout", type=float, default=30, help="Per-command prompt timeout")
     serial_run.add_argument("--newline", choices=("lf", "cr", "crlf"), default="lf")
-    serial_run.add_argument("--mode", choices=("raw", "posix-shell"), default="raw")
+    serial_run.add_argument(
+        "--mode",
+        choices=("raw", "posix-shell"),
+        default="posix-shell",
+        help=(
+            "posix-shell wraps each command so a real exit code can be reported (default); "
+            "raw sends the command verbatim for shells without sh, and then exit codes are unverified"
+        ),
+    )
     serial_run.add_argument("--continue-on-error", action="store_true")
     serial_run.add_argument("--json", action="store_true")
     add_output_guard_arguments(serial_run)
+    add_max_output_argument(serial_run)
     serial_run.set_defaults(func=command_serial_run)
 
     return parser
@@ -872,6 +1017,7 @@ def validate_arguments(args: argparse.Namespace) -> None:
         "duration",
         "idle_timeout",
         "initial_delay",
+        "max_output",
     ):
         if hasattr(args, field) and getattr(args, field) < 0:
             raise ToolError(f"--{field.replace('_', '-')} cannot be negative")
