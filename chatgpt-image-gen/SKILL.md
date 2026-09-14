@@ -14,37 +14,48 @@ Generate image(s) from a text description with ChatGPT via ego-browser, download
 
 ## Runtime notes (important)
 
-The installed ego lite runtime (0.4.4.x) preloads the **helper API** — `useOrCreateTaskSpace`, `openOrReuseTab`, `fillInput`, `click`, `js`, `wait`, `pageInfo`, `cliLog`, `completeTaskSpace` — not the `page` / `browser` / `taskSpaces` facades some ego-browser docs describe. Also: `wait(...)` and `timeout` are in **seconds**, `cliLog(...)` is the output channel, and the embedded node runtime does **not** inherit shell environment variables (pass data via files, like the script does, or interpolate into the heredoc). The bundled script already follows these rules — run it as-is instead of rewriting it against another API.
+The installed ego lite runtime preloads the **helper API** the bundled scripts use: `useOrCreateTaskSpace`, `openOrReuseTab`, `handOffTaskSpace`, `takeOverTaskSpace`, `listTaskSpaces`, `fillInput`, `click`, `js`, `wait`, `pageInfo`, `captureScreenshot`, `cliLog`, `completeTaskSpace` — not the `taskSpace` / `task.page` / `page.*` facades some ego-browser docs describe. Both currently coexist, but these scripts intentionally target the helper API, so run them as-is instead of rewriting them against another API. Also: `wait(...)` and `openOrReuseTab`'s `timeout` are in **seconds**, `cliLog(...)` is the output channel, and the embedded node runtime does **not** inherit shell environment variables (pass data via files, like the script does, or interpolate into the heredoc).
 
 ## Workflow
 
-1. **Decide the output path.** Save into the current working directory by default (the user said "保存到项目目录"). Derive a concise filename from the image description in the user's language, e.g. `西安旅游攻略图.png` for "帮我生成一张西安旅游攻略图". If the user gave a name or directory, use that. Default extension `.png` (ChatGPT returns PNG).
+1. **Decide the output path.** Save into the current working directory by default (the user said "保存到项目目录"). Derive a concise filename from the image description in the user's language, e.g. `西安旅游攻略图.png` for "帮我生成一张西安旅游攻略图". If the user gave a name or directory, use that. Default extension `.png` (ChatGPT usually returns PNG, but may return JPEG/WebP — the script corrects the extension to the real format, see Notes).
 
-2. **Run the generator** (takes 1–5 minutes; image generation is slow — set the Bash timeout to 300s):
+2. **Run the generator** (takes 1–5 minutes; image generation is slow — set the Bash timeout to 420s to cover the script's worst case):
 
    ```bash
    bash <this-skill-dir>/scripts/gen-image.sh "<image description>" "<absolute output path>"
    # or, to save the whole grid instead of just the largest image:
    bash <this-skill-dir>/scripts/gen-image.sh --all "<image description>" "<absolute output path>"
+   # or, to recover/grab images from an existing conversation (no new prompt):
+   bash <this-skill-dir>/scripts/gen-image.sh [--all] --resume "<conversation url>" "<absolute output path>"
    ```
 
-   It reuses the task space `chatgpt image generation`, opens a fresh ChatGPT chat, sends the description, polls until the image(s) appear, downloads them with the page's session cookies, and writes the file(s). The final line of output is **always a JSON status — including on failure** — so read it before deciding what to do.
+   It reuses the task space `chatgpt image generation`, opens a fresh ChatGPT chat, sends the description, polls until the image(s) appear, downloads them with the page's session cookies, and writes the file(s). Runs are serialized by a lock: if another run is already active the script exits immediately with `{"status":"busy", ...}`. The final line of output is **always a JSON status — including on failure** — so read it before deciding what to do.
 
 3. **Handle the exit code:**
    - `0` with `{"status":"ok", ...}` — `path` (single image) or `paths` (with `--all`) lists the saved file(s). Continue to step 4.
+   - `2` (`bad_arguments`) — the invocation was wrong (missing/extra args, unknown option). Fix the command; no browser run happened.
+   - `1` (`busy`) — another `gen-image.sh` run holds the lock. Wait for it to finish, then retry.
    - `42` (`login_required`) — hand the browser to the user so they can log in:
-      ```bash
-      ego-browser nodejs <<'EOF'
-      const t = await useOrCreateTaskSpace('chatgpt image generation')
-      const h = await handOffTaskSpace(t.id)
-      cliLog(JSON.stringify(h))
-      EOF
-      ```
-      Check `h.done`, then tell the user to log into ChatGPT in the ego lite window and say when done. Only after they confirm, take control back with a new `ego-browser nodejs` heredoc using `takeOverTaskSpace('chatgpt image generation')`, then rerun the generator.
-   - `1` with `image_timeout` — generation may still be running; open the conversation URL from the output, check visually with `captureScreenshot()`, and if the image has since appeared, fetch it manually (the poll + download snippet in the script is the reference). Otherwise report the failure.
-   - `1` with `download_failed` — the CDN responded with `http` (status code) or the bytes were not an image (`reason: 'not_an_image'` / `'empty'`). Retry once; if it repeats, report it.
-   - `1` with `internal_error` — the automation itself broke (element not found, CDP hiccup, ...); the JSON includes the underlying `error`. Retry once. If the same selector error repeats, the ChatGPT DOM likely changed — the script's selectors (`#prompt-textarea`, the submit-button fallback list) are the first thing to update.
-   - `1` with `fill_failed` / `submit_not_found` — the page rendered but the expected composer elements were missing; retry once, then treat as a DOM change (see `internal_error`).
+     ```bash
+     bash <this-skill-dir>/scripts/login.sh handoff
+     ```
+     The JSON has `done: true` when the handoff succeeded. Then tell the user to log into ChatGPT in the ego lite window and say when done. Only after they confirm, take control back with:
+     ```bash
+     bash <this-skill-dir>/scripts/login.sh takeover
+     ```
+     then rerun the generator.
+   - `1` (`output_not_writable`) — the output directory could not be created or written; the JSON has `path` and `error`. Pick a writable path and retry. This fails fast, before generation.
+   - `1` (`image_timeout`) — generation may still be running. Open the `conversation` URL from the output to check, and if the image has since appeared, recover it without re-prompting:
+     ```bash
+     bash <this-skill-dir>/scripts/gen-image.sh --resume "<conversation url>" "<absolute output path>"
+     ```
+     Otherwise report the failure.
+   - `1` (`partial`) — some but not all `--all` images downloaded; the JSON lists the saved `paths` plus `failed`/`reasons`. Keep the saved files and report which failed (retry with `--resume` to fetch the rest). Do not treat this as full success.
+   - `1` (`download_failed`) — every download failed; the JSON has the HTTP status (`http_*`) or `reason: 'not_an_image'` / `'empty'`. Retry once; if it repeats, report it.
+   - `1` (`write_failed`) — images downloaded but could not be written; the JSON has `paths` (already written) and `error`. Usually a disk/permission problem.
+   - `1` (`internal_error`) — the automation itself broke (element not found, CDP hiccup, ...); the JSON includes the underlying `error`. Retry once. If the same selector error repeats, the ChatGPT DOM likely changed — update the single `SEL` block at the top of the script's JS (composer, profile, login, submit selectors).
+   - `1` (`fill_failed` / `submit_not_found`) — the page rendered but the expected composer elements were missing; retry once, then treat as a DOM change (see `internal_error`).
 
 4. **Verify the saved image(s)** — each saved file exists, has non-trivial size (the script already rejects non-image bytes), and visually inspect them (e.g. read the image file) to confirm the content matches the description.
 
@@ -60,6 +71,8 @@ The installed ego lite runtime (0.4.4.x) preloads the **helper API** — `useOrC
 
 ## Notes
 
-- Each run sends exactly one image request. ChatGPT's GPT-4o usually renders a grid of 4: the default saves only the largest, `--all` saves every one as `<name>-1.png` (largest) through `<name>-4.png`, named in descending size order. For several *different* images, rerun the script per description rather than batching prompts in one chat — separate runs keep filenames and failure handling clean.
-- The script opens `https://chatgpt.com/` fresh each run, so every image starts a new chat. The ChatGPT conversation remains in the user's history.
-- Do not retry blindly on transient failure: read the JSON status first — it distinguishes login, timeout, download, and internal problems.
+- Each run sends exactly one image request. GPT image generation may return one or several images: the default saves only the largest, `--all` saves every one as `<name>-1.<ext>` (largest) through `<name>-N.<ext>`, named in descending size order. For several *different* images, rerun the script per description rather than batching prompts in one chat — separate runs keep filenames and failure handling clean.
+- The script probes image magic bytes and writes the file with the extension that matches the bytes. If the requested extension is a conventional image extension (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`), it is corrected to the real format — so a WebP response is never mislabeled `.png`. Files returned in the JSON `path`/`paths` are the authoritative names.
+- The script opens `https://chatgpt.com/` fresh each run, so every image starts a new chat. `--resume` instead reuses the given conversation URL. The ChatGPT conversation remains in the user's history either way.
+- Runs share one task space and tab, so they are serialized: do not launch concurrent `gen-image.sh` runs (the second exits `busy`).
+- Do not retry blindly on transient failure: read the JSON status first — it distinguishes login, busy, timeout, download, partial, write, and internal problems.
