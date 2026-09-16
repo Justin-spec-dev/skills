@@ -6,6 +6,8 @@ Read this file only when `doctor` reports a missing dependency or the connection
 
 - Python 3.9 or newer.
 - An OpenSSH client reachable as `ssh` for SSH operations.
+- `scp` from the same OpenSSH client, for artifact transfers. It is optional: when scp is missing, or the device offers no sftp subsystem, `deploy` falls back to a `cat` pipe over ssh. See [build-and-deploy.md](build-and-deploy.md).
+- A hash tool on the build environment (`sha256sum`, `shasum -a 256`, or `openssl dgst -sha256`) so an artifact can be hashed there before it is transferred.
 - PySerial for serial operations. From the skill directory, install it only with the user's approval:
 
   `python -m pip install -r requirements.txt`

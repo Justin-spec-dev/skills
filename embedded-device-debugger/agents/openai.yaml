@@ -1,4 +1,4 @@
 interface:
   display_name: "Embedded Device Debugger"
-  short_description: "通过 SSH 或串口安全诊断嵌入式 Linux 设备"
+  short_description: "通过 SSH 或串口安全诊断嵌入式 Linux 设备，并把构建产物送到设备上验证"
   default_prompt: "Use $embedded-device-debugger to connect to my device safely, collect logs, and diagnose the issue."

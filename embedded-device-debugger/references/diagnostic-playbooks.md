@@ -74,6 +74,19 @@ ps w
 
 Replace `SERVICE` only with the exact unit identified by the user or process evidence. On minimal systems inspect the relevant init script and log path. Do not restart a service just to see whether the problem goes away before preserving failure evidence.
 
+## A deployed artifact fails on the device
+
+```sh
+ls -l /tmp/app 2>/dev/null
+sha256sum /tmp/app 2>/dev/null || md5sum /tmp/app 2>/dev/null
+file /tmp/app 2>/dev/null
+readelf -l /tmp/app 2>/dev/null | grep -A1 interpreter
+mount | grep -E " /tmp | / " 2>/dev/null
+dmesg --color=never 2>/dev/null | tail -n 40 || dmesg | tail -n 40
+```
+
+Start by confirming the file that is actually on the device, not the one that was intended: compare its digest with the build artifact using `verify`, and check the ELF architecture and interpreter before reading any output as a program bug. An artifact that never ran at all — noexec mount, missing loader, wrong architecture — produces confusing errors that look like crashes. Preserve the failure evidence before replacing anything, and read [build-and-deploy.md](build-and-deploy.md) for the transfer and symbolization path.
+
 ## Evidence quality
 
 - Keep the exact command, stdout, stderr, exit status when available, and capture time.

@@ -38,3 +38,10 @@ jobs:
           python scripts/device_console.py doctor --json > /dev/null
           python scripts/device_console.py --help > /dev/null
           python scripts/device_console.py serial-run --help > /dev/null
+          # Every subparser is built at --help time, so this catches wiring errors
+          # in the build-to-device commands that unit tests would otherwise mask.
+          python scripts/device_console.py deploy --help > /dev/null
+          python scripts/device_console.py build-run --help > /dev/null
+          python scripts/device_console.py inspect --help > /dev/null
+          python scripts/device_console.py verify --help > /dev/null
+          python scripts/device_console.py symbolize --help > /dev/null
