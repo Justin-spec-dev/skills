@@ -35,7 +35,12 @@ jobs:
 
       - name: CLI smoke check
         run: |
-          python scripts/device_console.py doctor --json > /dev/null
+          # doctor exits 2 when a prerequisite is missing, and this runner has no
+          # PySerial by design, so 2 is its correct answer here. argparse also
+          # exits 2 for bad arguments, so the report must parse as well: a wiring
+          # error produces exit 2 with no report and still fails the step.
+          python scripts/device_console.py doctor --json > /tmp/doctor.json || test $? -eq 2
+          python -c "import json; json.load(open('/tmp/doctor.json'))"
           python scripts/device_console.py --help > /dev/null
           python scripts/device_console.py serial-run --help > /dev/null
           # Every subparser is built at --help time, so this catches wiring errors
